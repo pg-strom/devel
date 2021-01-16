@@ -22,6 +22,7 @@
 
 #include "access/brin.h"
 #include "access/brin_revmap.h"
+#include "access/generic_xlog.h"
 #include "access/gist.h"
 #include "access/hash.h"
 #include "access/heapam.h"
@@ -1439,6 +1440,12 @@ extern void ExecShutdownArrowFdw(ArrowFdwState *af_state);
 extern void ExplainArrowFdw(ArrowFdwState *af_state,
 							Relation frel, ExplainState *es);
 extern void pgstrom_init_arrow_fdw(void);
+
+/*
+ * gpu_store.c
+ */
+extern bool relationHasGpuStore(Relation rel);
+extern void pgstrom_init_gpu_store(void);
 
 /*
  * gstore_fdw.c

@@ -892,15 +892,6 @@ typedef struct {
 	cl_uint			nslots;		/* width of hash-slot (only HASH format) */
 	cl_uint			nrows_per_block; /* average number of rows per
 									  * PostgreSQL block (only BLOCK format) */
-#ifndef __CUDACC__
-	/*
-	 * Offset to the extra buffer (only COLUMN format, with varlena)
-	 * at the host-side, shall not be refered at the device-side.
-	 */
-	cl_ulong		extra_hoffset;
-#else
-	cl_ulong		__no_such_field__;
-#endif
 	cl_uint			nr_colmeta;	/* number of colmeta[] array elements;
 								 * maybe, >= ncols, if any composite types */
 	kern_colmeta	colmeta[FLEXIBLE_ARRAY_MEMBER]; /* metadata of columns */
@@ -911,7 +902,6 @@ typedef struct {
  */
 typedef struct
 {
-	char		signature[8];	/* signature on the base file */
 	cl_ulong	length;
 	cl_ulong	usage;
 	char		data[FLEXIBLE_ARRAY_MEMBER];
@@ -961,6 +951,7 @@ __kds_unpack(cl_uint offset)
  * The macros below are used for just cost estimation; no need to be strict
  * connect for size estimatino.
  */
+// use KDS_calculateHeadSize() instead
 #define KDS_ESTIMATE_HEAD_LENGTH(ncols)					\
 	STROMALIGN(offsetof(kern_data_store, colmeta[(ncols)]))
 #define KDS_ESTIMATE_ROW_LENGTH(ncols,nitems,htup_sz)					\

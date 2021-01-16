@@ -571,7 +571,7 @@ _PG_init(void)
 	pgstrom_init_gpupreagg();
 	pgstrom_init_relscan();
 	pgstrom_init_arrow_fdw();
-	pgstrom_init_gstore_fdw();
+	pgstrom_init_gpu_store();
 
 	/* dummy custom-scan node */
 	memset(&pgstrom_dummy_path_methods, 0, sizeof(CustomPathMethods));

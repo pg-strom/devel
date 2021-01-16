@@ -672,9 +672,13 @@ init_kernel_data_store(kern_data_store *kds,
 					   int format,
 					   uint nrooms)
 {
-	int			j, nr_colmeta = tupdesc->natts;
+	int			j, ncols = tupdesc->natts;
+	int			nr_colmeta;
 	int			attcacheoff = -1;
 
+	if (format == KDS_FORMAT_COLUMN)
+		ncols++;		/* internal system attribute */
+	nr_colmeta = ncols;
 	for (j=0; j < tupdesc->natts; j++)
 	{
 		Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
@@ -686,7 +690,7 @@ init_kernel_data_store(kern_data_store *kds,
 	kds->nitems = 0;
 	kds->usage = 0;
 	kds->nrooms = nrooms;
-	kds->ncols = tupdesc->natts;
+	kds->ncols = ncols;
 	kds->format = format;
 	kds->tdhasoid = tupleDescHasOid(tupdesc);
 	kds->tdtypeid = tupdesc->tdtypeid;
@@ -694,7 +698,7 @@ init_kernel_data_store(kern_data_store *kds,
 	kds->table_oid = InvalidOid;	/* caller shall set */
 	kds->nslots = 0;				/* caller shall set, if any */
 	kds->nrows_per_block = 0;
-	kds->nr_colmeta = tupdesc->natts;
+	kds->nr_colmeta = ncols;
 
 	if (format == KDS_FORMAT_ROW ||
 		format == KDS_FORMAT_HASH ||
@@ -717,6 +721,23 @@ init_kernel_data_store(kern_data_store *kds,
 									  attr->atttypid,
 									  attr->atttypmod,
 									  &attcacheoff);
+	}
+
+	/* internal system attribute for column data */
+	if (format == KDS_FORMAT_COLUMN)
+	{
+		kern_colmeta *cmeta = &kds->colmeta[tupdesc->natts];
+
+		Assert(kds->ncols == tupdesc->natts + 1);
+		cmeta->attbyval = true;
+		cmeta->attalign = sizeof(cl_uint);
+		cmeta->attlen = 3 * sizeof(cl_uint);
+		cmeta->attnum = ncols;
+		cmeta->attcacheoff = -1;
+		cmeta->atttypid = InvalidOid;	/* internal type */
+		cmeta->atttypmod = -1;
+		cmeta->atttypkind = TYPE_KIND__BASE;
+		strcpy(cmeta->attname.data, "__rowid__");
 	}
 	Assert(kds->nr_colmeta == nr_colmeta);
 }

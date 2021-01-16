@@ -54,17 +54,15 @@ CREATE TYPE pgstrom.gstore_fdw_sysattr
   ALIGNMENT = int4
 );
 
-CREATE FUNCTION pgstrom.gstore_fdw_replication_base(regclass,int)
-  RETURNS bytea
-  AS 'MODULE_PATHNAME','pgstrom_gstore_fdw_replication_base'
-  LANGUAGE C STRICT;
-CREATE FUNCTION pgstrom.gstore_fdw_replication_redo(regclass, bigint,
-													float = 5.0,     -- 5.0sec
-													bigint = 64,     -- 64kB
-													bigint = 131072) -- 128MB
-  RETURNS bytea
-  AS 'MODULE_PATHNAME','pgstrom_gstore_fdw_replication_redo'
-  LANGUAGE C STRICT;
+---
+--- GPU memory store
+---
+
+--- gpustore_synchronizer(max_num_rows, gpu_device_id)
+CREATE FUNCTION pgstrom.gpustore_synchronizer(bigint,int=-1)
+  RETURNS trigger
+  AS 'MODULE_PATHNAME','pgstrom_gpustore_synchronizer'
+  LANGUAGE C;
 
 ---
 --- Deprecated functions

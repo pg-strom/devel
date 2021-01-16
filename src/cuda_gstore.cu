@@ -299,8 +299,8 @@ __gpustore_apply_delete(kern_context *kcxt,
 						GstoreTxLogDelete *d_log,
 						GstoreFdwSysattr *sysattr)
 {
-	sysattr->xmin = d_log->xmin;
-	sysattr->xmax = d_log->xmax;
+//	sysattr->xmin = d_log->xmin;
+	sysattr->xmax = d_log->xid;
 }
 
 STATIC_FUNCTION(void)

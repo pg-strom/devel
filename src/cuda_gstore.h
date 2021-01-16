@@ -45,8 +45,7 @@ typedef struct {
 	cl_uint		length;
 	cl_ulong	timestamp;
 	cl_uint		rowid;
-	cl_uint		xmin;
-	cl_uint		xmax;
+	cl_uint		xid;
 } GstoreTxLogDelete;
 
 /*
@@ -71,12 +70,8 @@ struct GstoreFdwSysattr
 {
 	cl_uint		xmin;
 	cl_uint		xmax;
-#ifndef __CUDACC__
-	cl_uint		cid;
-#else
-	/* get_global_id() of the thread who tries to update the row. */
+	/* get_global_id() of the thread who tries to update the row */
 	cl_uint		owner_id;
-#endif
 };
 typedef struct GstoreFdwSysattr	GstoreFdwSysattr;
 
@@ -219,6 +214,15 @@ pg_sysattr_tableoid_fetch_column(kern_context *kcxt,
 	return 0;
 }
 #endif
+
+/*
+ * kern_gpustore_init_load
+ */
+typedef struct
+{
+	kern_errorbuf	kerror;
+	kern_data_store	kds_row;
+} kern_gpustore_initial_load;
 
 /*
  * kern_gpustore_redolog
