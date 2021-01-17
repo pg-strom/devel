@@ -326,8 +326,8 @@ pgstromInitGpuTaskState(GpuTaskState *gts,
 		if (RelationIsArrowFdw(relation))
 			gts->af_state = ExecInitArrowFdw(optimal_gpu < 0 ? NULL : gcontext,
 											 relation, outer_refs);
-		if (RelationIsGstoreFdw(relation))
-			gts->gs_state = ExecInitGstoreFdw(&gts->css.ss, eflags, outer_refs);
+		if (RelationHasGpuStore(relation))
+			gts->gs_state = ExecInitGpuStore(&gts->css.ss, eflags, outer_refs);
 	}
 	gts->outer_refs = outer_refs;
 	gts->scan_done = false;
@@ -566,7 +566,7 @@ pgstromRescanGpuTaskState(GpuTaskState *gts)
 	if (gts->af_state)
 		ExecReScanArrowFdw(gts->af_state);
 	if (gts->gs_state)
-		ExecReScanGstoreFdw(gts->gs_state);
+		ExecReScanGpuStore(gts->gs_state);
 }
 
 /*
@@ -596,7 +596,7 @@ pgstromReleaseGpuTaskState(GpuTaskState *gts, GpuTaskRuntimeStat *gt_rtstat)
 	if (gts->af_state)
 		ExecEndArrowFdw(gts->af_state);
 	if (gts->gs_state)
-		ExecEndGstoreFdw(gts->gs_state);
+		ExecEndGpuStore(gts->gs_state);
 	/* unreference CUDA program */
 	if (gts->program_id != INVALID_PROGRAM_ID)
 		pgstrom_put_cuda_program(gts->gcontext, gts->program_id);
@@ -665,7 +665,7 @@ pgstromExplainGpuTaskState(GpuTaskState *gts, ExplainState *es)
 	if (gts->af_state)
 		ExplainArrowFdw(gts->af_state, rel, es);
 	if (gts->gs_state)
-		ExplainGstoreFdw(gts->gs_state, rel, es);
+		ExplainGpuStore(gts->gs_state, rel, es);
 	/* Debug counter, if any */
 	if (es->analyze && (gts->debug_counter0 != 0 ||
 						gts->debug_counter1 != 0 ||
@@ -707,7 +707,7 @@ pgstromEstimateDSMGpuTaskState(GpuTaskState *gts, ParallelContext *pcxt)
 	}
 	else if (gts->gs_state)
 	{
-		return ExecEstimateDSMGstoreFdw(gts->gs_state);
+		return ExecEstimateDSMGpuStore(gts->gs_state);
 	}
 	else if (relation)
 	{
@@ -739,7 +739,7 @@ pgstromInitDSMGpuTaskState(GpuTaskState *gts,
 	}
 	else if (gts->gs_state)
 	{
-		ExecInitDSMGstoreFdw(gts->gs_state, &gtss->gstore_read_pos);
+		ExecInitDSMGpuStore(gts->gs_state, &gtss->gstore_read_pos);
 	}
 	else if (relation)
 	{
@@ -772,7 +772,7 @@ pgstromInitWorkerGpuTaskState(GpuTaskState *gts, void *coordinate)
 	}
 	else if (gts->gs_state)
 	{
-		ExecInitWorkerGstoreFdw(gts->gs_state, &gtss->gstore_read_pos);
+		ExecInitWorkerGpuStore(gts->gs_state, &gtss->gstore_read_pos);
 	}
 	else if (relation)
 	{
@@ -803,7 +803,7 @@ pgstromReInitializeDSMGpuTaskState(GpuTaskState *gts)
 	if (gts->af_state)
 		ExecReInitDSMArrowFdw(gts->af_state);
 	else if (gts->gs_state)
-		ExecReInitDSMGstoreFdw(gts->gs_state);
+		ExecReInitDSMGpuStore(gts->gs_state);
 	else if (relation)
 		table_parallelscan_reinitialize(relation, &gtss->phscan);
 }

@@ -225,6 +225,15 @@ typedef struct
 } kern_gpustore_initial_load;
 
 /*
+ * kern_gpustore_baserel
+ */
+typedef struct
+{
+	kern_errorbuf	kerror;
+	kern_data_store	kds_row;
+} kern_gpustore_baserel;
+
+/*
  * kern_gpustore_redolog
  */
 typedef struct

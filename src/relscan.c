@@ -464,8 +464,8 @@ pgstrom_common_relscan_cost(PlannerInfo *root,
 	/* mark if special storage layer */
 	if (baseRelIsArrowFdw(scan_rel))
 		scan_mode |= PGSTROM_RELSCAN_ARROW_FDW;
-	if (baseRelIsGstoreFdw(scan_rel))
-		scan_mode |= PGSTROM_RELSCAN_GSTORE_FDW;
+	if (baseRelHasGpuStore(root, scan_rel))
+		scan_mode |= PGSTROM_RELSCAN_GPU_STORE;
 
 	/* selectivity of device executable qualifiers */
 	selectivity = clauselist_selectivity(root,
@@ -474,7 +474,7 @@ pgstrom_common_relscan_cost(PlannerInfo *root,
 										 JOIN_INNER,
 										 NULL);
 	/* cost of full-table scan, if not gpu memory store */
-	if ((scan_mode & PGSTROM_RELSCAN_GSTORE_FDW) == 0)
+	if ((scan_mode & PGSTROM_RELSCAN_GPU_STORE) == 0)
 	{
 		get_tablespace_page_costs(scan_rel->reltablespace,
 								  &spc_rand_page_cost,

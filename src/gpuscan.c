@@ -231,7 +231,7 @@ create_gpuscan_path(PlannerInfo *root,
 						: baserel->rows) / parallel_divisor;
 
 	/* cost for DMA receive (GPU-->host) */
-	if ((scan_mode & PGSTROM_RELSCAN_GSTORE_FDW) == 0)
+	if ((scan_mode & PGSTROM_RELSCAN_GPU_STORE) == 0)
 		run_cost += cost_for_dma_receive(baserel, scan_ntuples);
 
 	/* cost for CPU qualifiers */
@@ -314,8 +314,7 @@ gpuscan_add_scan_path(PlannerInfo *root,
 	 */
 	if (rte->relkind == RELKIND_FOREIGN_TABLE)
 	{
-		if (!baseRelIsArrowFdw(baserel) &&
-			!baseRelIsGstoreFdw(baserel))
+		if (!baseRelIsArrowFdw(baserel))
 			return;
 	}
 	else if (rte->relkind != RELKIND_RELATION &&
@@ -1490,8 +1489,7 @@ pgstrom_pullup_outer_scan(PlannerInfo *root,
 		if (pgstrom_path_is_gpuscan(outer_path))
 			break;	/* OK, only if GpuScan */
 		if (outer_path->pathtype == T_ForeignScan &&
-			(baseRelIsArrowFdw(outer_path->parent) ||
-			 baseRelIsGstoreFdw(outer_path->parent)))
+			baseRelIsArrowFdw(outer_path->parent))
 			break;	/* OK, only if ArrowFdw or GstoreFdw */
 		if (IsA(outer_path, ProjectionPath))
 		{
@@ -2172,7 +2170,7 @@ gpuscan_next_task(GpuTaskState *gts)
 	if (gss->gts.af_state)
 		pds = ExecScanChunkArrowFdw(gts);
 	else if (gss->gts.gs_state)
-		pds = ExecScanChunkGstoreFdw(gts);
+		pds = ExecScanChunkGpuStore(gts);
 	else
 		pds = pgstromExecScanChunk(gts);
 	if (!pds)
@@ -2810,7 +2808,7 @@ gpuscan_process_task(GpuTask *gtask, CUmodule cuda_module)
 	{
 		if (pds_src->kds.format == KDS_FORMAT_COLUMN)
 		{
-			rc = gstoreFdwMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+			rc = gpuStoreMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 			if (rc != CUDA_SUCCESS)
 				werror("failed on gstoreFdwMapDeviceMemory: %s", errorText(rc));
 			gstore_mapped = true;
@@ -2820,12 +2818,12 @@ gpuscan_process_task(GpuTask *gtask, CUmodule cuda_module)
 	STROM_CATCH();
     {
 		if (gstore_mapped)
-			gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+			gpuStoreUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
         STROM_RE_THROW();
     }
     STROM_END_TRY();
 	if (gstore_mapped)
-		gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+		gpuStoreUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 
 	return retval;
 }

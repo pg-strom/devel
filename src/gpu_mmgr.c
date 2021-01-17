@@ -1303,17 +1303,17 @@ gpummgrBgWorkerMain(Datum arg)
 
 	/* initial setup */
 	gpummgrBgWorkerBegin(cuda_dindex);
-	gstoreFdwBgWorkerBegin(cuda_dindex);
+	gpuStoreBgWorkerBegin(cuda_dindex);
 	/*
 	 * Event loop
 	 */
 	while (!gpummgr_bgworker_got_signal)
 	{
 		if (gpummgrBgWorkerDispatch(cuda_dindex) &
-			gstoreFdwBgWorkerDispatch(cuda_dindex))
+			gpuStoreBgWorkerDispatch(cuda_dindex))
 		{
 			if (gpummgrBgWorkerIdleTask(cuda_dindex) &
-				gstoreFdwBgWorkerIdleTask(cuda_dindex))
+				gpuStoreBgWorkerIdleTask(cuda_dindex))
 			{
 				int		ev = WaitLatch(MyLatch,
 									   WL_LATCH_SET |
@@ -1329,7 +1329,7 @@ gpummgrBgWorkerMain(Datum arg)
 	}
 	/* Exit */
 	gpummgrBgWorkerEnd(cuda_dindex);
-	gstoreFdwBgWorkerEnd(cuda_dindex);
+	gpuStoreBgWorkerEnd(cuda_dindex);
 }
 
 /*

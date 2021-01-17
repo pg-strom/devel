@@ -312,7 +312,8 @@ typedef struct GpuTask				GpuTask;
 typedef struct GpuTaskState			GpuTaskState;
 typedef struct GpuTaskSharedState	GpuTaskSharedState;
 typedef struct ArrowFdwState		ArrowFdwState;
-typedef struct GpuStoreFdwState		GpuStoreFdwState;
+//typedef struct GpuStoreFdwState		GpuStoreFdwState;
+typedef struct GpuStoreState		GpuStoreState;
 
 /*
  * GpuTaskState
@@ -349,7 +350,7 @@ struct GpuTaskState
 	long			outer_brin_count;	/* # of blocks skipped by index */
 
 	ArrowFdwState  *af_state;			/* for GpuTask on Arrow_Fdw */
-	GpuStoreFdwState *gs_state;			/* for GpuTask on Gstore_Fdw */
+	GpuStoreState  *gs_state;			/* for GpuTask on GpuStore */
 
 	/*
 	 * A state object for NVMe-Strom. If not NULL, GTS prefers BLOCK format
@@ -1187,21 +1188,6 @@ extern bool KDS_fetch_tuple_row(TupleTableSlot *slot,
 extern bool KDS_fetch_tuple_slot(TupleTableSlot *slot,
 								 kern_data_store *kds,
 								 size_t row_index);
-extern Datum KDS_fetch_datum_column(kern_data_store *kds,
-									kern_colmeta *cmeta,
-									size_t row_index,
-									bool *p_isnull);
-extern void __KDS_store_datum_column(kern_data_store *kds,
-									 kern_colmeta *cmeta,
-									 size_t row_index,
-									 Datum datum, bool isnull);
-extern void  KDS_store_datum_column(kern_data_store *kds,
-									kern_colmeta *cmeta,
-									size_t row_index,
-									Datum datum, bool isnull);
-extern bool KDS_fetch_tuple_column(TupleTableSlot *slot,
-								   kern_data_store *kds,
-								   size_t row_index);
 extern bool PDS_fetch_tuple(TupleTableSlot *slot,
 							pgstrom_data_store *pds,
 							GpuTaskState *gts);
@@ -1284,7 +1270,7 @@ extern IndexOptInfo *pgstrom_tryfind_brinindex(PlannerInfo *root,
 #define PGSTROM_RELSCAN_SSD2GPU			0x0001
 #define PGSTROM_RELSCAN_BRIN_INDEX		0x0002
 #define PGSTROM_RELSCAN_ARROW_FDW		0x0004
-#define PGSTROM_RELSCAN_GSTORE_FDW		0x0008
+#define PGSTROM_RELSCAN_GPU_STORE		0x0008
 extern int pgstrom_common_relscan_cost(PlannerInfo *root,
 									   RelOptInfo *scan_rel,
 									   List *scan_quals,
@@ -1444,41 +1430,33 @@ extern void pgstrom_init_arrow_fdw(void);
 /*
  * gpu_store.c
  */
-extern bool relationHasGpuStore(Relation rel);
+extern bool baseRelHasGpuStore(PlannerInfo *root,
+							   RelOptInfo *baserel);
+
+extern bool RelationHasGpuStore(Relation rel);
+extern GpuStoreState *ExecInitGpuStore(ScanState *ss, int eflags,
+									   Bitmapset *outer_refs);
+extern pgstrom_data_store *ExecScanChunkGpuStore(GpuTaskState *gts);
+extern void ExecReScanGpuStore(GpuStoreState *gstore_state);
+extern void ExecEndGpuStore(GpuStoreState *gstore_state);
+extern Size ExecEstimateDSMGpuStore(GpuStoreState *gstore_state);
+extern void ExecInitDSMGpuStore(GpuStoreState *gstore_state,
+								pg_atomic_uint64 *gstore_read_pos);
+extern void ExecReInitDSMGpuStore(GpuStoreState *gstore_state);
+extern void ExecInitWorkerGpuStore(GpuStoreState *gstore_state,
+								   pg_atomic_uint64 *gstore_read_pos);
+extern void ExecShutdownGpuStore(GpuStoreState *gstore_state);
+extern void ExplainGpuStore(GpuStoreState *gstore_state,
+							Relation frel, ExplainState *es);
+extern CUresult gpuStoreMapDeviceMemory(GpuContext *gcontext,
+										pgstrom_data_store *pds);
+extern void gpuStoreUnmapDeviceMemory(GpuContext *gcontext,
+									  pgstrom_data_store *pds);
+extern void gpuStoreBgWorkerBegin(int cuda_dindex);
+extern bool gpuStoreBgWorkerDispatch(int cuda_dindex);
+extern bool gpuStoreBgWorkerIdleTask(int cuda_dindex);
+extern void gpuStoreBgWorkerEnd(int cuda_dindex);
 extern void pgstrom_init_gpu_store(void);
-
-/*
- * gstore_fdw.c
- */
-extern bool	baseRelIsGstoreFdw(RelOptInfo *baserel);
-extern bool RelationIsGstoreFdw(Relation frel);
-extern int	GetOptimalGpuForGstoreFdw(PlannerInfo *root,
-									  RelOptInfo *baserel);
-extern GpuStoreFdwState *ExecInitGstoreFdw(ScanState *ss, int eflags,
-										   Bitmapset *outer_refs);
-extern pgstrom_data_store *ExecScanChunkGstoreFdw(GpuTaskState *gts);
-extern void ExecReScanGstoreFdw(GpuStoreFdwState *gstore_state);
-extern void ExecEndGstoreFdw(GpuStoreFdwState *gstore_state);
-extern Size ExecEstimateDSMGstoreFdw(GpuStoreFdwState *gstore_state);
-extern void ExecInitDSMGstoreFdw(GpuStoreFdwState *gstore_state,
-								 pg_atomic_uint64 *gstore_read_pos);
-extern void ExecReInitDSMGstoreFdw(GpuStoreFdwState *gstore_state);
-extern void ExecInitWorkerGstoreFdw(GpuStoreFdwState *gstore_state,
-									pg_atomic_uint64 *gstore_read_pos);
-extern void ExecShutdownGstoreFdw(GpuStoreFdwState *gstore_state);
-extern void ExplainGstoreFdw(GpuStoreFdwState *af_state,
-							 Relation frel, ExplainState *es);
-extern CUresult gstoreFdwMapDeviceMemory(GpuContext *gcontext,
-										 pgstrom_data_store *pds);
-extern void gstoreFdwUnmapDeviceMemory(GpuContext *gcontext,
-									   pgstrom_data_store *pds);
-
-#define GSTORE_FDW_SYSATTR_OID		6116
-extern void gstoreFdwBgWorkerBegin(int cuda_dindex);
-extern bool gstoreFdwBgWorkerDispatch(int cuda_dindex);
-extern bool gstoreFdwBgWorkerIdleTask(int cuda_dindex);
-extern void gstoreFdwBgWorkerEnd(int cuda_dindex);
-extern void pgstrom_init_gstore_fdw(void);
 
 /*
  * misc.c

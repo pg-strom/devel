@@ -6045,7 +6045,7 @@ GpuJoinExecOuterScanChunk(GpuTaskState *gts)
 		if (gjs->gts.af_state)
 			pds = ExecScanChunkArrowFdw(gts);
 		else if (gjs->gts.gs_state)
-			pds = ExecScanChunkGstoreFdw(gts);
+			pds = ExecScanChunkGpuStore(gts);
 		else
 			pds = pgstromExecScanChunk(gts);
 	}
@@ -6115,7 +6115,7 @@ gpujoin_next_task(GpuTaskState *gts)
 	if (gjs->gts.af_state)
 		pds = ExecScanChunkArrowFdw(gts);
 	else if (gjs->gts.gs_state)
-		pds = ExecScanChunkGstoreFdw(gts);
+		pds = ExecScanChunkGpuStore(gts);
 	else
 		pds = GpuJoinExecOuterScanChunk(gts);
 	if (pds)
@@ -7632,7 +7632,7 @@ gpujoin_process_task(GpuTask *gtask, CUmodule cuda_module)
 		{
 			if (pds_src->kds.format == KDS_FORMAT_COLUMN)
 			{
-				rc = gstoreFdwMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+				rc = gpuStoreMapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 				if (rc != CUDA_SUCCESS)
 					werror("failed on gstoreFdwMapDeviceMemory: %s", errorText(rc));
 				gstore_mapped = true;
@@ -7647,12 +7647,12 @@ gpujoin_process_task(GpuTask *gtask, CUmodule cuda_module)
 	STROM_CATCH();
 	{
 		if (gstore_mapped)
-			gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+			gpuStoreUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 		STROM_RE_THROW();
 	}
 	STROM_END_TRY();
 	if (gstore_mapped)
-		gstoreFdwUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
+		gpuStoreUnmapDeviceMemory(GpuWorkerCurrentContext, pds_src);
 	return retval;
 }
 
