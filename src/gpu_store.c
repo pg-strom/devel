@@ -39,12 +39,12 @@ typedef struct
 /*
  * GpuStoreSharedHead (shared structure; static)
  */
-#define GPUSTORE_SHARED_DESC_NSLOTS		107
+#define GPUSTORE_SHARED_DESC_NSLOTS		37
 typedef struct
 {
-	/* hash slot for GpuStoreSharedState */
-	slock_t		gstore_sstate_lock[GPUSTORE_SHARED_DESC_NSLOTS];
-	dlist_head	gstore_sstate_slot[GPUSTORE_SHARED_DESC_NSLOTS];
+	/* hash slot for GpuStoreSharedDesc */
+	slock_t		gstore_sdesc_lock[GPUSTORE_SHARED_DESC_NSLOTS];
+	dlist_head	gstore_sdesc_slot[GPUSTORE_SHARED_DESC_NSLOTS];
 	/* database name for preloading */
 	int			preload_database_status;
 	char		preload_database_name[NAMEDATALEN];
@@ -59,7 +59,7 @@ typedef struct
 } GpuStoreSharedHead;
 
 /*
- * GpuStoreRowIdHash / GpuStoreRowId / GpuStoreRedoBuffer (shared structure; DSM)
+ * GpuStoreRowIdHash / GpuStoreRowId (shared structure; DSM)
  */
 typedef struct
 {
@@ -77,20 +77,6 @@ typedef struct
 	ItemPointerData	ctid;
 } GpuStoreRowId;
 
-#define REDO_BUFFER_SIZE		(128UL << 20)		/* 128MB */
-typedef struct
-{
-	size_t		length;
-	slock_t		lock;
-	uint64		timestamp;
-	uint64		write_nitems;
-	uint64		write_pos;
-	uint64		read_nitems;
-	uint64		read_pos;
-	uint64		sync_pos;
-	char		buffer[FLEXIBLE_ARRAY_MEMBER];
-} GpuStoreRedoBuffer;
-
 static inline GpuStoreRowIdHash *
 __gpuStoreRowIdHash(dsm_segment *shbuf_seg)
 {
@@ -107,18 +93,8 @@ __gpuStoreRowIdMap(dsm_segment *shbuf_seg)
 											   hash_slot[rowhash->nslots])));
 }
 
-static inline GpuStoreRedoBuffer *
-__gpuStoreRedoBuffer(dsm_segment *shbuf_seg)
-{
-	GpuStoreRowIdHash  *rowhash = __gpuStoreRowIdHash(shbuf_seg);
-	GpuStoreRowId	   *rowmap = __gpuStoreRowIdMap(shbuf_seg);
-
-	return (GpuStoreRedoBuffer *)
-		((char *)rowmap + STROMALIGN(sizeof(GpuStoreRowId) * rowhash->nrooms));
-}
-
 /*
- * GpuStoreSharedState (shared structure; dynamic portable)
+ * GpuStoreSharedDesc (shared structure; dynamic portable)
  */
 typedef struct
 {
@@ -131,13 +107,28 @@ typedef struct
 	/* GPU memory store parameter */
 	int64		max_num_rows;
 	int32		cuda_dindex;
-	/* device data store */
+	size_t		redo_length;
+	size_t		redo_apply_threshold;
+	int32		redo_apply_interval;
+
+	/* Device resources */
 	pthread_rwlock_t gpu_buffer_lock;
 	CUipcMemHandle	gpu_main_mhandle;
 	CUipcMemHandle	gpu_extra_mhandle;
 	size_t			gpu_main_size;
 	size_t			gpu_extra_size;
-} GpuStoreSharedState;
+
+#define GPUSTORE_REDO_BUFFER_SIZE		((128UL << 20) - 1024)
+	/* REDO buffer properties */
+	slock_t		redo_lock;
+	uint64		redo_timestamp;
+	uint64		redo_write_nitems;
+	uint64		redo_write_pos;
+	uint64		redo_read_nitems;
+	uint64		redo_read_pos;
+	uint64		redo_sync_pos;
+	char		redo_buffer[FLEXIBLE_ARRAY_MEMBER];
+} GpuStoreSharedDesc;
 
 /*
  * PendingRowIdArray / PendingRowIdItem
@@ -164,11 +155,10 @@ typedef struct
 {
 	Oid					database_oid;
 	Oid					table_oid;
-	GpuStoreSharedState *gs_sstate; /* NULL, if no GPU Store */
+	GpuStoreSharedDesc *gs_sdesc; /* NULL, if no GPU Store */
 	dsm_segment		   *shbuf_seg;
 	GpuStoreRowIdHash  *rowhash;	/* DSM */
 	GpuStoreRowId	   *rowmap;		/* DSM */
-	GpuStoreRedoBuffer *redo_buf;	/* DSM */
 	PendingRowIdArray  *pending_rowid_last;
 	dlist_head			pending_rowid_list;
 } GpuStoreDesc;
@@ -182,10 +172,10 @@ static void	  (*gstore_xact_redo_next)(XLogReaderState *record) = NULL;
 static void	  (*gstore_heap_redo_next)(XLogReaderState *record) = NULL;
 
 /* --- function declarations --- */
-static CUresult gpuStoreInvokeApplyRedo(GpuStoreSharedState *gs_sstate,
+static CUresult gpuStoreInvokeApplyRedo(GpuStoreSharedDesc *gs_sdesc,
 										uint64 end_pos,
 										bool is_async);
-static CUresult gpuStoreInvokeCompaction(GpuStoreSharedState *gs_sstate,
+static CUresult gpuStoreInvokeCompaction(GpuStoreSharedDesc *gs_sdesc,
 										 bool is_async);
 Datum	pgstrom_gpustore_synchronizer(PG_FUNCTION_ARGS);
 void	GpuStoreStartupPreloader(Datum arg);
@@ -336,7 +326,7 @@ baseRelHasGpuStore(PlannerInfo *root, RelOptInfo *baserel)
 						HASH_FIND,
 						NULL);
 		if (gs_desc)
-			retval = (gs_desc->gs_sstate != NULL ? true : false);
+			retval = (gs_desc->gs_sdesc != NULL ? true : false);
 		else
 		{
 			rel = relation_open(rte->relid, NoLock);
@@ -351,8 +341,8 @@ baseRelHasGpuStore(PlannerInfo *root, RelOptInfo *baserel)
 								HASH_ENTER,
 								&found);
 				Assert(!found);
-				memset(&gs_desc->gs_sstate, 0,
-					   sizeof(GpuStoreDesc) - offsetof(GpuStoreDesc, gs_sstate));
+				memset(&gs_desc->gs_sdesc, 0,
+					   sizeof(GpuStoreDesc) - offsetof(GpuStoreDesc, gs_sdesc));
 				dlist_init(&gs_desc->pending_rowid_list);
 			}
 			relation_close(rel, NoLock);
@@ -419,14 +409,12 @@ __gpuStoreAllocateDSM(GpuStoreDesc *gs_desc, int64 nrooms, int64 nslots)
 {
 	GpuStoreRowIdHash  *rowhash;
 	GpuStoreRowId	   *rowmap;
-	GpuStoreRedoBuffer *redo_buf;
 	dsm_segment		   *shbuf_seg;
 	size_t				sz;
 	int64				i;
 
 	sz = (STROMALIGN(offsetof(GpuStoreRowIdHash, hash_slot[nslots])) +
-		  STROMALIGN(sizeof(GpuStoreRowId) * nrooms) +
-		  STROMALIGN(offsetof(GpuStoreRedoBuffer, buffer) + REDO_BUFFER_SIZE));
+		  STROMALIGN(sizeof(GpuStoreRowId) * nrooms));
 	shbuf_seg = dsm_create(sz, 0);
 	if (!shbuf_seg)
 		elog(ERROR, "failed on dsm_create(%zu, 0)", sz);
@@ -444,16 +432,9 @@ __gpuStoreAllocateDSM(GpuStoreDesc *gs_desc, int64 nrooms, int64 nslots)
 	{
 		rowmap[i-1].next = (i < nrooms ? i : UINT_MAX);
 	}
-
-	redo_buf = __gpuStoreRedoBuffer(shbuf_seg);
-	memset(redo_buf, 0, offsetof(GpuStoreRedoBuffer, buffer));
-	redo_buf->length = REDO_BUFFER_SIZE;
-	SpinLockInit(&redo_buf->lock);
-
 	gs_desc->shbuf_seg = shbuf_seg;
 	gs_desc->rowhash   = rowhash;
 	gs_desc->rowmap    = rowmap;
-	gs_desc->redo_buf  = redo_buf;
 }
 
 /*
@@ -635,7 +616,7 @@ __GpuStoreExecInitialLoad(Relation rel,
 						  GpuStoreDesc *gs_desc,
 						  CUmodule cuda_module)
 {
-	GpuStoreSharedState *gs_sstate = gs_desc->gs_sstate;
+	GpuStoreSharedDesc *gs_sdesc = gs_desc->gs_sdesc;
 	TupleDesc		tupdesc = RelationGetDescr(rel);
 	CUfunction		kfunc_init_load;
 	CUdeviceptr		m_main = 0UL;
@@ -644,7 +625,7 @@ __GpuStoreExecInitialLoad(Relation rel,
 	kern_gpustore_baserel *kgs_base;
 	kern_data_store *kds_main;
 	kern_data_extra kds_extra;
-	int64			nrooms = gs_sstate->max_num_rows;
+	int64			nrooms = gs_sdesc->max_num_rows;
 	int64			nslots = Min((double)nrooms * 1.25, UINT_MAX);
 	size_t			sz;
 
@@ -681,21 +662,21 @@ __GpuStoreExecInitialLoad(Relation rel,
 		rc = __gpuOptimalBlockSize(&grid_sz,
 								   &block_sz,
 								   kfunc_init_load,
-								   gs_sstate->cuda_dindex, 0, 0);
+								   gs_sdesc->cuda_dindex, 0, 0);
 		if (rc != CUDA_SUCCESS)
 			elog(ERROR, "failed on __gpuOptimalBlockSize: %s", errorText(rc));
 		grid_sz = Min(grid_sz, (kds_main->nitems +
 								block_sz - 1) / block_sz);
 
 		/* preserve the main store */
-		rc = gpuMemAllocPreserved(gs_sstate->cuda_dindex,
-								  &gs_sstate->gpu_main_mhandle,
+		rc = gpuMemAllocPreserved(gs_sdesc->cuda_dindex,
+								  &gs_sdesc->gpu_main_mhandle,
 								  kds_main->length);
 		if (rc != CUDA_SUCCESS)
 			elog(ERROR, "failed on gpuMemAllocPreserved: %s", errorText(rc));
-		gs_sstate->gpu_main_size = kds_main->length;
+		gs_sdesc->gpu_main_size = kds_main->length;
 
-		rc = cuIpcOpenMemHandle(&m_main, gs_sstate->gpu_main_mhandle,
+		rc = cuIpcOpenMemHandle(&m_main, gs_sdesc->gpu_main_mhandle,
 								CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS);
 		if (rc != CUDA_SUCCESS)
 			elog(ERROR, "failed on cuIpcOpenMemHandle: %s", errorText(rc));
@@ -709,14 +690,14 @@ __GpuStoreExecInitialLoad(Relation rel,
 		/* preserve the extra store, if any */
 		if (kds_extra.length > 0)
 		{
-			rc = gpuMemAllocPreserved(gs_sstate->cuda_dindex,
-									  &gs_sstate->gpu_extra_mhandle,
+			rc = gpuMemAllocPreserved(gs_sdesc->cuda_dindex,
+									  &gs_sdesc->gpu_extra_mhandle,
 									  kds_extra.length);
 			if (rc != CUDA_SUCCESS)
 				elog(ERROR, "failed on gpuMemAllocPreserved: %s", errorText(rc));
-			gs_sstate->gpu_extra_size = kds_extra.length;
+			gs_sdesc->gpu_extra_size = kds_extra.length;
 
-			rc = cuIpcOpenMemHandle(&m_extra, gs_sstate->gpu_extra_mhandle,
+			rc = cuIpcOpenMemHandle(&m_extra, gs_sdesc->gpu_extra_mhandle,
 									CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS);
 			if (rc != CUDA_SUCCESS)
 				elog(ERROR, "failed on cuIpcOpenMemHandle: %s", errorText(rc));
@@ -763,11 +744,11 @@ __GpuStoreExecInitialLoad(Relation rel,
 				elog(ERROR, "failed on cuIpcCloseMemHandle: %s", errorText(rc));
 			m_extra = 0UL;
 
-			rc = gpuMemFreePreserved(gs_sstate->cuda_dindex,
-									 gs_sstate->gpu_extra_mhandle);
+			rc = gpuMemFreePreserved(gs_sdesc->cuda_dindex,
+									 gs_sdesc->gpu_extra_mhandle);
 			if (rc != CUDA_SUCCESS)
 				elog(ERROR, "failed on gpuMemFreePreserved: %s", errorText(rc));
-			gs_sstate->gpu_extra_size = 0;
+			gs_sdesc->gpu_extra_size = 0;
 			goto retry;
 		}
 		else if (kgs_base->kerror.errcode != 0)
@@ -791,10 +772,10 @@ __GpuStoreExecInitialLoad(Relation rel,
 				elog(WARNING, "failed on cuIpcCloseMemHandle: %s", errorText(rc));
 		}
 
-		if (gs_sstate->gpu_main_size > 0)
+		if (gs_sdesc->gpu_main_size > 0)
 		{
-			rc = gpuMemFreePreserved(gs_sstate->cuda_dindex,
-									 gs_sstate->gpu_main_mhandle);
+			rc = gpuMemFreePreserved(gs_sdesc->cuda_dindex,
+									 gs_sdesc->gpu_main_mhandle);
 			if (rc != CUDA_SUCCESS)
 				elog(WARNING, "failed on gpuMemFreePreserved: %s", errorText(rc));
 		}
@@ -806,10 +787,10 @@ __GpuStoreExecInitialLoad(Relation rel,
 				elog(WARNING, "failed on cuIpcCloseMemHandle: %s", errorText(rc));
 		}
 
-		if (gs_sstate->gpu_extra_size > 0)
+		if (gs_sdesc->gpu_extra_size > 0)
 		{
-			rc = gpuMemFreePreserved(gs_sstate->cuda_dindex,
-									 gs_sstate->gpu_extra_mhandle);
+			rc = gpuMemFreePreserved(gs_sdesc->cuda_dindex,
+									 gs_sdesc->gpu_extra_mhandle);
 			if (rc != CUDA_SUCCESS)
 				elog(WARNING, "failed on gpuMemFreePreserved: %s", errorText(rc));
 		}
@@ -829,7 +810,7 @@ __GpuStoreExecInitialLoad(Relation rel,
 			elog(WARNING, "failed on cuIpcCloseMemHandle: %s", errorText(rc));
 	}
 	/* all Ok, so pin DSM mapping */
-	gs_sstate->shbuf_handle = dsm_segment_handle(gs_desc->shbuf_seg);
+	gs_sdesc->shbuf_handle = dsm_segment_handle(gs_desc->shbuf_seg);
 	dsm_pin_mapping(gs_desc->shbuf_seg);
 	dsm_pin_segment(gs_desc->shbuf_seg);
 }
@@ -837,8 +818,8 @@ __GpuStoreExecInitialLoad(Relation rel,
 static void
 GpuStoreExecInitialLoad(Relation rel, GpuStoreDesc *gs_desc)
 {
-	GpuStoreSharedState *gs_sstate = gs_desc->gs_sstate;
-	int			cuda_dindex = gs_sstate->cuda_dindex;
+	GpuStoreSharedDesc *gs_sdesc = gs_desc->gs_sdesc;
+	int			cuda_dindex = gs_sdesc->cuda_dindex;
 	CUdevice	cuda_device;
 	CUcontext	cuda_context = NULL;
 	CUmodule	cuda_module = NULL;
@@ -897,8 +878,7 @@ GpuStoreLookupOrCreateSharedState(Relation rel,
 								  int64 max_num_rows,
 								  int32 cuda_dindex)
 {
-	GpuStoreSharedState *gs_sstate = NULL;
-	GpuStoreRedoBuffer  *redo_buf = NULL;
+	GpuStoreSharedDesc *gs_sdesc = NULL;
 	dsm_segment *shbuf_seg;
 	Oid			hkey[2];
 	uint32		hash, hindex;
@@ -910,22 +890,22 @@ GpuStoreLookupOrCreateSharedState(Relation rel,
 	hkey[1] = RelationGetRelid(rel);
 	hash = hash_any((const unsigned char *)hkey, sizeof(hkey));
 	hindex = hash % GPUSTORE_SHARED_DESC_NSLOTS;
-	lock = &gstore_shared_head->gstore_sstate_lock[hindex];
-	slot = &gstore_shared_head->gstore_sstate_slot[hindex];
+	lock = &gstore_shared_head->gstore_sdesc_lock[hindex];
+	slot = &gstore_shared_head->gstore_sdesc_slot[hindex];
 retry:
 	CHECK_FOR_INTERRUPTS();
 
 	SpinLockAcquire(lock);
 	dlist_foreach(iter, slot)
 	{
-		gs_sstate = dlist_container(GpuStoreSharedState, chain, iter.cur);
-		if (gs_sstate->database_oid == MyDatabaseId &&
-			gs_sstate->table_oid == RelationGetRelid(rel))
+		gs_sdesc = dlist_container(GpuStoreSharedDesc, chain, iter.cur);
+		if (gs_sdesc->database_oid == MyDatabaseId &&
+			gs_sdesc->table_oid == RelationGetRelid(rel))
 		{
-			if (gs_sstate->initial_load_in_progress)
+			if (gs_sdesc->initial_load_in_progress)
 			{
 				/*
-				 * It means someone already allocated GpuStoreSharedState,
+				 * It means someone already allocated GpuStoreSharedDesc,
 				 * however, initial loading is still in-progress.
 				 * So, we need to wait for completion of the initial task.
 				 */
@@ -935,61 +915,66 @@ retry:
 				goto retry;
 			}
 			SpinLockRelease(lock);
-			/* Ok, GpuStoreSharedState is already available */
-			shbuf_seg = dsm_attach(gs_sstate->shbuf_handle);
+			/* Ok, GpuStoreSharedDesc is already available */
+			shbuf_seg = dsm_attach(gs_sdesc->shbuf_handle);
 			if (!shbuf_seg)
 				elog(ERROR, "GPU Store: failed on dsm_attach: %m");
-			gs_desc->gs_sstate = gs_sstate;
+			gs_desc->gs_sdesc = gs_sdesc;
+			gs_desc->shbuf_seg = shbuf_seg;
 			gs_desc->rowhash   = __gpuStoreRowIdHash(shbuf_seg);
 			gs_desc->rowmap    = __gpuStoreRowIdMap(shbuf_seg);
-			gs_desc->redo_buf  = __gpuStoreRedoBuffer(shbuf_seg);
 
 			return;
 		}
 	}
-	gs_sstate = NULL;
+	gs_sdesc = NULL;
 
 	/*
-	 * Hmm, there is no GpuStoreSharedState, so create a new one
+	 * Hmm, there is no GpuStoreSharedDesc, so create a new one
 	 * then load relation's contents to GPU Store. A tough work.
 	 */
 	PG_TRY();
 	{
-		/* allocation of GpuStoreSharedState */
-		gs_sstate = MemoryContextAllocZero(TopSharedMemoryContext,
-										   sizeof(GpuStoreSharedState));
-		gs_sstate->database_oid = MyDatabaseId;
-		gs_sstate->table_oid = RelationGetRelid(rel);
-		gs_sstate->initial_load_in_progress = true;		/* !!! blocker !!! */
-		gs_sstate->max_num_rows = max_num_rows;
-		gs_sstate->cuda_dindex = cuda_dindex;
-		pthreadRWLockInit(&gs_sstate->gpu_buffer_lock);
-		dlist_push_tail(slot, &gs_sstate->chain);
+		/* Allocation of GpuStoreSharedDesc */
+		gs_sdesc = MemoryContextAlloc(TopSharedMemoryContext,
+									  offsetof(GpuStoreSharedDesc, redo_buffer) +
+									  GPUSTORE_REDO_BUFFER_SIZE);
+		memset(gs_sdesc, 0, offsetof(GpuStoreSharedDesc, redo_buffer));
+		gs_sdesc->database_oid = MyDatabaseId;
+		gs_sdesc->table_oid = RelationGetRelid(rel);
+		gs_sdesc->initial_load_in_progress = true;		/* !!! blocker !!! */
+		gs_sdesc->max_num_rows = max_num_rows;
+		gs_sdesc->cuda_dindex = cuda_dindex;
+		gs_sdesc->redo_length = GPUSTORE_REDO_BUFFER_SIZE;
+		gs_sdesc->redo_apply_threshold = GPUSTORE_REDO_BUFFER_SIZE / 4;
+		gs_sdesc->redo_apply_interval = 5;		/* 5s from last update */
+		pthreadRWLockInit(&gs_sdesc->gpu_buffer_lock);
+		SpinLockInit(&gs_sdesc->redo_lock);
+
+		dlist_push_tail(slot, &gs_sdesc->chain);
 		SpinLockRelease(lock);
 
 		PG_TRY();
 		{
 			/* initial loading from the relation */
-			gs_desc->gs_sstate = gs_sstate;
+			gs_desc->gs_sdesc = gs_sdesc;
 			GpuStoreExecInitialLoad(rel, gs_desc);
 		}
 		PG_CATCH();
 		{
 			SpinLockAcquire(lock);
-			dlist_delete(&gs_sstate->chain);
+			dlist_delete(&gs_sdesc->chain);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 		
 		SpinLockAcquire(lock);
-		gs_sstate->initial_load_in_progress = false;
+		gs_sdesc->initial_load_in_progress = false;
 	}
 	PG_CATCH();
 	{
-		if (redo_buf)
-			pfree(redo_buf);
-		if (gs_sstate)
-			pfree(gs_sstate);
+		if (gs_sdesc)
+			pfree(gs_sdesc);
 		SpinLockRelease(lock);
 		PG_RE_THROW();
 	}
@@ -1020,8 +1005,8 @@ GpuStoreLookupDesc(Relation rel)
 			int64	max_num_rows;
 			int32	cuda_dindex;
 
-			memset(&gs_desc->gs_sstate, 0,
-				   sizeof(GpuStoreDesc) - offsetof(GpuStoreDesc, gs_sstate));
+			memset(&gs_desc->gs_sdesc, 0,
+				   sizeof(GpuStoreDesc) - offsetof(GpuStoreDesc, gs_sdesc));
 			if (relationHasSynchronizer(rel, &max_num_rows, &cuda_dindex))
 			{
 				GpuStoreLookupOrCreateSharedState(rel,
@@ -1038,7 +1023,7 @@ GpuStoreLookupDesc(Relation rel)
 		}
 		PG_END_TRY();
 	}
-	return (gs_desc->gs_sstate != NULL ? gs_desc : NULL);
+	return (gs_desc->gs_sdesc != NULL ? gs_desc : NULL);
 }
 
 /*
@@ -1142,7 +1127,8 @@ __gpuStoreReleaseRowId(GpuStoreDesc *gs_desc, ItemPointer ctid)
 static void
 __gpuStoreAppendLog(GpuStoreDesc *gs_desc, GstoreTxLogCommon *tx_log)
 {
-	GpuStoreRedoBuffer *redo = gs_desc->redo_buf;
+	GpuStoreSharedDesc *gs_sdesc = gs_desc->gs_sdesc;
+	size_t		redo_length = gs_sdesc->redo_length;
 	uint64		offset;
 	uint64		sync_pos;
 	bool		append_done = false;
@@ -1150,46 +1136,47 @@ __gpuStoreAppendLog(GpuStoreDesc *gs_desc, GstoreTxLogCommon *tx_log)
 	Assert(tx_log->length == MAXALIGN(tx_log->length));
 	for (;;)
 	{
-		SpinLockAcquire(&redo->lock);
-		Assert(redo->write_pos >= redo->read_pos &&
-			   redo->write_pos <= redo->read_pos + redo->length &&
-			   redo->sync_pos >= redo->read_pos &&
-			   redo->sync_pos <= redo->write_pos);
-		offset = redo->write_pos % redo->length;
+		SpinLockAcquire(&gs_sdesc->redo_lock);
+		Assert(gs_sdesc->redo_write_pos >= gs_sdesc->redo_read_pos &&
+			   gs_sdesc->redo_write_pos <= gs_sdesc->redo_read_pos + redo_length &&
+			   gs_sdesc->redo_sync_pos >= gs_sdesc->redo_read_pos &&
+			   gs_sdesc->redo_sync_pos <= gs_sdesc->redo_write_pos);
+		offset = gs_sdesc->redo_write_pos % redo_length;
 		/* rewind to the head */
-		if (offset + tx_log->length > redo->length)
+		if (offset + tx_log->length > redo_length)
 		{
-			size_t	sz = redo->length - offset;
+			size_t	sz = redo_length - offset;
 
 			/* oops, it looks overwrites... */
-			if (redo->write_pos + sz > redo->read_pos + redo->length)
+			if (gs_sdesc->redo_write_pos + sz > gs_sdesc->redo_read_pos + redo_length)
 				goto skip;
 			/* fill-up by zero */
-			memset(redo->buffer + offset, 0, sz);
-			redo->write_pos += sz;
+			memset(gs_sdesc->redo_buffer + offset, 0, sz);
+			gs_sdesc->redo_write_pos += sz;
 			offset = 0;
 		}
-
 		/* check overwrites */
-		if (redo->write_pos + tx_log->length > redo->read_pos + redo->length)
+		if ((gs_sdesc->redo_write_pos +
+			 tx_log->length) > gs_sdesc->redo_read_pos + redo_length)
 			goto skip;
 
 		/* Ok, append the log item */
-		memcpy(redo->buffer + offset, tx_log, tx_log->length);
-		redo->write_pos += tx_log->length;
-		redo->timestamp = GetCurrentTimestamp();
+		memcpy(gs_sdesc->redo_buffer + offset, tx_log, tx_log->length);
+		gs_sdesc->redo_write_pos += tx_log->length;
+		gs_sdesc->redo_timestamp = GetCurrentTimestamp();
 		append_done = true;
 	skip:
 		/* 25% of REDO buffer is in-use. Async kick of GPU kernel */
-		if (redo->write_pos > redo->sync_pos + redo->length / 4)
+		if (gs_sdesc->redo_write_pos > (gs_sdesc->redo_read_pos +
+										gs_sdesc->redo_apply_threshold))
 		{
-			sync_pos = redo->sync_pos = redo->write_pos;
-			SpinLockRelease(&redo->lock);
-			gpuStoreInvokeApplyRedo(gs_desc->gs_sstate, sync_pos, true);
+			sync_pos = gs_sdesc->redo_sync_pos = gs_sdesc->redo_write_pos;
+			SpinLockRelease(&gs_sdesc->redo_lock);
+			gpuStoreInvokeApplyRedo(gs_sdesc, sync_pos, true);
 		}
 		else
 		{
-			SpinLockRelease(&redo->lock);
+			SpinLockRelease(&gs_sdesc->redo_lock);
 		}
 		if (append_done)
 			break;
@@ -1580,13 +1567,13 @@ __gpuStoreInvokeBackgroundCommand(Oid database_oid,
  * GSTORE_BACKGROUND_CMD__APPLY_REDO
  */
 static CUresult
-gpuStoreInvokeApplyRedo(GpuStoreSharedState *gs_sstate,
+gpuStoreInvokeApplyRedo(GpuStoreSharedDesc *gs_sdesc,
 						uint64 end_pos,
 						bool is_async)
 {
-	return __gpuStoreInvokeBackgroundCommand(gs_sstate->database_oid,
-											 gs_sstate->table_oid,
-											 gs_sstate->cuda_dindex,
+	return __gpuStoreInvokeBackgroundCommand(gs_sdesc->database_oid,
+											 gs_sdesc->table_oid,
+											 gs_sdesc->cuda_dindex,
 											 is_async,
 											 GSTORE_BACKGROUND_CMD__APPLY_REDO,
 											 end_pos);
@@ -1596,11 +1583,11 @@ gpuStoreInvokeApplyRedo(GpuStoreSharedState *gs_sstate,
  * GSTORE_BACKGROUND_CMD__COMPACTION
  */
 static CUresult
-gpuStoreInvokeCompaction(GpuStoreSharedState *gs_sstate, bool is_async)
+gpuStoreInvokeCompaction(GpuStoreSharedDesc *gs_sdesc, bool is_async)
 {
-	return __gpuStoreInvokeBackgroundCommand(gs_sstate->database_oid,
-											 gs_sstate->table_oid,
-											 gs_sstate->cuda_dindex,
+	return __gpuStoreInvokeBackgroundCommand(gs_sdesc->database_oid,
+											 gs_sdesc->table_oid,
+											 gs_sdesc->cuda_dindex,
 											 is_async,
 											 GSTORE_BACKGROUND_CMD__COMPACTION,
 											 0);
@@ -1640,7 +1627,12 @@ gstore_heap_redo_hook(XLogReaderState *record)
  */
 void
 gpuStoreBgWorkerBegin(int cuda_dindex)
-{}
+{
+	Assert(cuda_dindex >= 0 && cuda_dindex < numDevAttrs);
+	SpinLockAcquire(&gstore_shared_head->bgworker_cmd_lock);
+	gstore_shared_head->bgworkers[cuda_dindex].latch = MyLatch;
+	SpinLockRelease(&gstore_shared_head->bgworker_cmd_lock);
+}
 
 /*
  * gpuStoreBgWorkerDispatch
@@ -1648,7 +1640,46 @@ gpuStoreBgWorkerBegin(int cuda_dindex)
 bool
 gpuStoreBgWorkerDispatch(int cuda_dindex)
 {
-	return false;
+	GpuStoreBackgroundCommand *cmd;
+	slock_t	   *cmd_lock = &gstore_shared_head->bgworker_cmd_lock;
+	dlist_head *free_cmds = &gstore_shared_head->bgworker_free_cmds;
+	dlist_head *cmd_queue = &gstore_shared_head->bgworkers[cuda_dindex].cmd_queue;
+	dlist_node *dnode;
+
+	SpinLockAcquire(cmd_lock);
+	if (dlist_is_empty(cmd_queue))
+	{
+		SpinLockRelease(cmd_lock);
+		return true;	/* GpuStore allows bgworker to sleep */
+	}
+	dnode = dlist_pop_head_node(cmd_queue);
+	cmd = dlist_container(GpuStoreBackgroundCommand, chain, dnode);
+    memset(&cmd->chain, 0, sizeof(dlist_node));
+    SpinLockRelease(cmd_lock);
+
+	cmd->retval = EINVAL;
+
+	SpinLockAcquire(cmd_lock);
+	if (cmd->backend)
+	{
+		/*
+		 * A backend process who kicked GpuStore maintainer is waiting
+		 * for the response. It shall check the retval, and return the
+		 * GpuStoreBackgroundCommand to free list again.
+		 */
+		SetLatch(cmd->backend);
+	}
+	else
+	{
+		/*
+		 * GpuStore maintainer was kicked asynchronously, so nobody is
+		 * waiting for the response, thus, GpuStoreBackgroundCommand
+		 * must be backed to the free list again.
+		 */
+		dlist_push_head(free_cmds, &cmd->chain);
+	}
+	SpinLockRelease(cmd_lock);
+   	return false;
 }
 
 /*
@@ -1657,7 +1688,63 @@ gpuStoreBgWorkerDispatch(int cuda_dindex)
 bool
 gpuStoreBgWorkerIdleTask(int cuda_dindex)
 {
-	return false;
+	slock_t    *cmd_lock = &gstore_shared_head->bgworker_cmd_lock;
+	dlist_head *free_cmds = &gstore_shared_head->bgworker_free_cmds;
+	dlist_head *cmd_queue = &gstore_shared_head->bgworkers[cuda_dindex].cmd_queue;
+	int			hindex;
+	bool		retval = false;
+
+	for (hindex = 0; hindex < GPUSTORE_SHARED_DESC_NSLOTS; hindex++)
+	{
+		slock_t    *lock = &gstore_shared_head->gstore_sdesc_lock[hindex];
+		dlist_head *slot = &gstore_shared_head->gstore_sdesc_slot[hindex];
+		dlist_iter	iter;
+
+		SpinLockAcquire(lock);
+		dlist_foreach(iter, slot)
+		{
+			GpuStoreSharedDesc *gs_sdesc;
+			uint64		timestamp;
+
+			gs_sdesc = dlist_container(GpuStoreSharedDesc,
+									   chain, iter.cur);
+			if (gs_sdesc->cuda_dindex != cuda_dindex)
+				continue;
+			SpinLockAcquire(&gs_sdesc->redo_lock);
+			timestamp = GetCurrentTimestamp();
+			if (gs_sdesc->redo_write_nitems > gs_sdesc->redo_read_nitems &&
+				timestamp > (gs_sdesc->redo_apply_interval * 1000000L +
+							 gs_sdesc->redo_timestamp))
+			{
+				SpinLockAcquire(cmd_lock);
+				if (!dlist_is_empty(free_cmds))
+				{
+					GpuStoreBackgroundCommand *cmd;
+
+					cmd = dlist_container(GpuStoreBackgroundCommand, chain,
+                                          dlist_pop_head_node(free_cmds));
+					memset(cmd, 0, sizeof(GpuStoreBackgroundCommand));
+					cmd->database_oid = gs_sdesc->database_oid;
+                    cmd->table_oid    = gs_sdesc->table_oid;
+                    cmd->backend      = NULL;
+                    cmd->command      = GSTORE_BACKGROUND_CMD__APPLY_REDO;
+                    cmd->end_pos      = gs_sdesc->redo_write_pos;
+                    cmd->retval       = (CUresult) UINT_MAX;
+
+					dlist_push_tail(cmd_queue, &cmd->chain);
+
+					gs_sdesc->redo_sync_pos = gs_sdesc->redo_write_pos;
+					gs_sdesc->redo_timestamp = timestamp;
+				}
+				SpinLockRelease(cmd_lock);
+
+				retval = true;
+			}
+			SpinLockRelease(&gs_sdesc->redo_lock);
+		}
+		SpinLockRelease(lock);
+	}
+	return retval;
 }
 
 /*
@@ -1665,7 +1752,12 @@ gpuStoreBgWorkerIdleTask(int cuda_dindex)
  */
 void
 gpuStoreBgWorkerEnd(int cuda_dindex)
-{}
+{
+	Assert(cuda_dindex >= 0 && cuda_dindex < numDevAttrs);
+	SpinLockAcquire(&gstore_shared_head->bgworker_cmd_lock);
+	gstore_shared_head->bgworkers[cuda_dindex].latch = NULL;
+	SpinLockRelease(&gstore_shared_head->bgworker_cmd_lock);
+}
 
 /*
  * pgstrom_startup_gpu_store
@@ -1687,8 +1779,8 @@ pgstrom_startup_gpu_store(void)
 	memset(gstore_shared_head, 0, sz);
 	for (i=0; i < GPUSTORE_SHARED_DESC_NSLOTS; i++)
 	{
-		SpinLockInit(&gstore_shared_head->gstore_sstate_lock[i]);
-		dlist_init(&gstore_shared_head->gstore_sstate_slot[i]);
+		SpinLockInit(&gstore_shared_head->gstore_sdesc_lock[i]);
+		dlist_init(&gstore_shared_head->gstore_sdesc_slot[i]);
 	}
 	/* IPC to GPU memory keeper background worker */
 	SpinLockInit(&gstore_shared_head->bgworker_cmd_lock);
