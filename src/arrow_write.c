@@ -298,49 +298,6 @@ __makeBufferFlatten(FBTableBuf *buf, const char *func_name)
 #define makeBufferFlatten(a)	__makeBufferFlatten((a),__FUNCTION__)
 
 /*
- * sql_buffer_write
- */
-static void
-sql_buffer_write(int fdesc, SQLbuffer *buf)
-{
-	ssize_t		length = buf->usage;
-	ssize_t		offset = 0;
-	ssize_t		nbytes;
-
-	while (offset < length)
-	{
-		nbytes = write(fdesc, buf->data + offset, length - offset);
-		if (nbytes < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			Elog("failed on write(2): %m");
-		}
-		offset += nbytes;
-	}
-
-	if (length != ARROWALIGN(length))
-	{
-		ssize_t	gap = ARROWALIGN(length) - length;
-		char	zero[64];
-
-		offset = 0;
-		memset(zero, 0, sizeof(zero));
-		while (offset < gap)
-		{
-			nbytes = write(fdesc, zero + offset, gap - offset);
-			if (nbytes < 0)
-			{
-				if (errno == EINTR)
-					continue;
-				Elog("failed on write(2): %m");
-			}
-			offset += nbytes;
-		}
-	}
-}
-
-/*
  * Arrow v0.15 didn't allow Filed->type is null object, even if type has
  * no parameters. So, we inject an empty flat-buffer entry.
  */
@@ -852,6 +809,46 @@ createArrowFooter(ArrowFooter *node)
 /* ----------------------------------------------------------------
  * Routines for File I/O
  * ---------------------------------------------------------------- */
+#if 1
+void
+arrowFileWrite(SQLtable *table, const char *buffer, ssize_t length)
+{
+	ssize_t		offset = 0;
+	ssize_t		nbytes;
+
+	assert(lseek(table->fdesc, SEEK_CUR, 0) == table->f_pos);
+	while (offset < length)
+	{
+		nbytes = write(table->fdesc, buffer + offset, length - offset);
+		if (nbytes <= 0)
+		{
+			if (errno == EINTR)
+				continue;
+			Elog("failed on write('%s'): %m", table->filename);
+		}
+		offset += nbytes;
+	}
+	table->f_pos += length;
+}
+#endif
+
+/*
+ * sql_buffer_write - A wrapper of arrowFileWrite for SQLbuffer
+ */
+static inline void
+sql_buffer_write(SQLtable *table, SQLbuffer *buf)
+{
+	ssize_t		length = buf->usage;
+	ssize_t		gap = ARROWALIGN(length) - length;
+	char		zero[64];
+
+	arrowFileWrite(table, buf->data, length);
+	if (gap)
+	{
+		memset(zero, 0, gap);
+		arrowFileWrite(table, zero, gap);
+	}
+}
 
 /*
  * writeFlatBufferMessage
@@ -865,14 +862,13 @@ typedef struct
 } FBMessageFileImage;
 
 static ssize_t
-writeFlatBufferMessage(int fdesc, ArrowMessage *message)
+writeFlatBufferMessage(SQLtable *table, ArrowMessage *message)
 {
 	FBTableBuf *payload = createArrowMessage(message);
 	FBMessageFileImage *image;
 	ssize_t		offset;
 	ssize_t		gap;
 	ssize_t		length;
-	ssize_t		nbytes;
 
 	assert(payload->length > 0);
 	offset = TYPEALIGN(payload->maxalign, payload->vtable.vlen);
@@ -886,18 +882,8 @@ writeFlatBufferMessage(int fdesc, ArrowMessage *message)
 	image->rootOffset = sizeof(int32_t) + offset;
 	memcpy(image->data + gap, &payload->vtable, payload->length);
 
-	offset = 0;
-	while (offset < length)
-	{
-		nbytes = write(fdesc, (char *)image + offset, length - offset);
-		if (nbytes < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			Elog("failed on write: %m");
-		}
-		offset += nbytes;
-	}
+	arrowFileWrite(table, (const char *)image, length);
+
 	return length;
 }
 
@@ -916,28 +902,29 @@ typedef struct
 	char		signature[6];
 } FBFooterTailImage;
 
-static ssize_t
-writeFlatBufferFooter(int fdesc, ArrowFooter *footer)
+static void
+writeFlatBufferFooter(SQLtable *table, ArrowFooter *footer)
 {
 	FBTableBuf *payload = createArrowFooter(footer);
 	FBFooterFileImage *image;
 	FBFooterTailImage *tail;
+	char	   *buffer;
 	ssize_t		nbytes;
 	ssize_t		offset;
 	ssize_t		length;
 	uint64_t	eos = 0xffffffffUL;
 
-	/* put EOS and ensure 64bit alignment */
-	nbytes = write(fdesc, &eos, sizeof(uint64_t));
-	if (nbytes != sizeof(uint64_t))
-		Elog("failed on write: %m");
-
 	assert(payload->length > 0);
-    offset = INTALIGN(payload->vtable.vlen) - payload->vtable.vlen;
+	offset = INTALIGN(payload->vtable.vlen) - payload->vtable.vlen;
 	nbytes = INTALIGN(offset + payload->length);
 	length = (offsetof(FBFooterFileImage, data[nbytes]) +
 			  offsetof(FBFooterTailImage, signature[6]));
-	image = alloca(length + 1);
+	buffer = alloca(sizeof(uint64_t) + length + 1);
+
+	/* put EOS mark */
+	memcpy(buffer, &eos, sizeof(uint64_t));
+	/* put headers */
+	image = (FBFooterFileImage *)(buffer + sizeof(uint64_t));
 	image->rootOffset = sizeof(int32_t) + INTALIGN(payload->vtable.vlen);
 	if (offset > 0)
 		memset(image->data, 0, offset);
@@ -948,9 +935,8 @@ writeFlatBufferFooter(int fdesc, ArrowFooter *footer)
 	tail = (FBFooterTailImage *)(image->data + nbytes);
 	tail->metaOffset = nbytes + sizeof(int32_t);
 	strcpy(tail->signature, "ARROW1");
-	if (write(fdesc, image, length) != length)
-		Elog("failed on write: %m");
-	return length;
+
+	arrowFileWrite(table, buffer, sizeof(uint64_t) + length);
 }
 
 static void
@@ -1024,7 +1010,7 @@ writeArrowSchema(SQLtable *table)
 	schema->custom_metadata = table->customMetadata;
 	schema->_num_custom_metadata = table->numCustomMetadata;
 	/* serialization */
-	return writeFlatBufferMessage(table->fdesc, &message);
+	return writeFlatBufferMessage(table, &message);
 }
 
 
@@ -1032,7 +1018,7 @@ writeArrowSchema(SQLtable *table)
  * writeArrowDictionaryBatches
  */
 static ArrowBlock
-__writeArrowDictionaryBatch(int fdesc, SQLdictionary *dict)
+__writeArrowDictionaryBatch(SQLtable *table, SQLdictionary *dict)
 {
 	ArrowMessage	message;
 	ArrowDictionaryBatch *dbatch;
@@ -1040,7 +1026,7 @@ __writeArrowDictionaryBatch(int fdesc, SQLdictionary *dict)
 	ArrowFieldNode	fnodes[1];
 	ArrowBuffer		buffers[3];
 	ArrowBlock		block;
-	loff_t			currPos;
+	loff_t			curr_pos;
 	size_t			metaLength = 0;
 	size_t			bodyLength = 0;
 
@@ -1087,16 +1073,15 @@ __writeArrowDictionaryBatch(int fdesc, SQLdictionary *dict)
     message.version = ArrowMetadataVersion__V4;
 	message.bodyLength = bodyLength;
 
-	currPos = lseek(fdesc, 0, SEEK_CUR);
-	if (currPos < 0)
-		Elog("unable to get current position of the file");
-	metaLength = writeFlatBufferMessage(fdesc, &message);
-	sql_buffer_write(fdesc, &dict->values);
-	sql_buffer_write(fdesc, &dict->extra);
+	assert(lseek(table->fdesc, 0, SEEK_CUR) == table->f_pos);
+	curr_pos = table->f_pos;
+	metaLength = writeFlatBufferMessage(table, &message);
+	sql_buffer_write(table, &dict->values);
+	sql_buffer_write(table, &dict->extra);
 
 	/* setup Block of Footer */
 	initArrowNode(&block, Block);
-	block.offset = currPos;
+	block.offset = curr_pos;
 	block.metaDataLength = metaLength;
 	block.bodyLength = bodyLength;
 
@@ -1120,7 +1105,7 @@ writeArrowDictionaryBatches(SQLtable *table)
 		else
 			table->dictionaries = repalloc(table->dictionaries,
 										   sizeof(ArrowBlock) * (index+1));
-		block = __writeArrowDictionaryBatch(table->fdesc, dict);
+		block = __writeArrowDictionaryBatch(table, dict);
 		table->dictionaries[index++] = block;
 	}
 	table->numDictionaries = index;
@@ -1355,15 +1340,15 @@ estimateArrowBufferLength(SQLfield *column, size_t nitems)
 }
 
 static void
-writeArrowBuffer(int fdesc, SQLfield *column)
+writeArrowBuffer(SQLtable *table, SQLfield *column)
 {
 	if (column->enumdict)
 	{
 		/* Enum data types */
 		assert(column->arrow_type.node.tag == ArrowNodeTag__Utf8);
 		if (column->nullcount > 0)
-			sql_buffer_write(fdesc, &column->nullmap);
-		sql_buffer_write(fdesc, &column->values);
+			sql_buffer_write(table, &column->nullmap);
+		sql_buffer_write(table, &column->values);
 	}
 	else if (column->element)
 	{
@@ -1371,9 +1356,9 @@ writeArrowBuffer(int fdesc, SQLfield *column)
 		assert(column->arrow_type.node.tag == ArrowNodeTag__List ||
 			   column->arrow_type.node.tag == ArrowNodeTag__LargeList);
 		if (column->nullcount > 0)
-			sql_buffer_write(fdesc, &column->nullmap);
-		sql_buffer_write(fdesc, &column->values);
-		writeArrowBuffer(fdesc, column->element);
+			sql_buffer_write(table, &column->nullmap);
+		sql_buffer_write(table, &column->values);
+		writeArrowBuffer(table, column->element);
 	}
 	else if (column->subfields)
 	{
@@ -1382,9 +1367,9 @@ writeArrowBuffer(int fdesc, SQLfield *column)
 		/* Composite data types */
 		assert(column->arrow_type.node.tag == ArrowNodeTag__Struct);
 		if (column->nullcount > 0)
-			sql_buffer_write(fdesc, &column->nullmap);
+			sql_buffer_write(table, &column->nullmap);
 		for (j=0; j < column->nfields; j++)
-			writeArrowBuffer(fdesc, &column->subfields[j]);
+			writeArrowBuffer(table, &column->subfields[j]);
 	}
 	else
 	{
@@ -1401,8 +1386,8 @@ writeArrowBuffer(int fdesc, SQLfield *column)
 			case ArrowNodeTag__Interval:
 			case ArrowNodeTag__FixedSizeBinary:
 				if (column->nullcount > 0)
-					sql_buffer_write(fdesc, &column->nullmap);
-				sql_buffer_write(fdesc, &column->values);
+					sql_buffer_write(table, &column->nullmap);
+				sql_buffer_write(table, &column->values);
 				break;
 
 			/* variable length type */
@@ -1411,9 +1396,9 @@ writeArrowBuffer(int fdesc, SQLfield *column)
 			case ArrowNodeTag__LargeUtf8:
 			case ArrowNodeTag__LargeBinary:
 				if (column->nullcount > 0)
-					sql_buffer_write(fdesc, &column->nullmap);
-				sql_buffer_write(fdesc, &column->values);
-				sql_buffer_write(fdesc, &column->extra);
+					sql_buffer_write(table, &column->nullmap);
+				sql_buffer_write(table, &column->values);
+				sql_buffer_write(table, &column->extra);
 				break;
 
 			default:
@@ -1455,24 +1440,25 @@ writeArrowRecordBatch(SQLtable *table)
 	ArrowBlock	   *block;
 	int				i, j;
 	int				index;
-	off_t			currPos;
+	off_t			curr_pos;
+	volatile off_t hoge;
 	size_t			metaLength;
 	size_t			bodyLength = 0;
 
 	assert(table->nitems > 0);
-	/* adjust current file position */
-	currPos = lseek(table->fdesc, 0, SEEK_CUR);
-	if (currPos < 0)
-		Elog("unable to get current position of the file");
-	if (currPos != LONGALIGN(currPos))
+	/* align current file position, if needed */
+	if (table->f_pos != LONGALIGN(table->f_pos))
 	{
 		uint64_t	zero = 0;
-		size_t 		gap = LONGALIGN(currPos) - currPos;
+		size_t		gap = LONGALIGN(table->f_pos) - table->f_pos;
 
-		if (write(table->fdesc, &zero, gap) != gap)
-			Elog("unable to fill up alignment gap: %m");
+		arrowFileWrite(table, (const char *)&zero, gap);
 	}
-
+	hoge = lseek(table->fdesc, 0, SEEK_CUR);
+	assert(hoge == table->f_pos);
+//	assert(lseek(table->fdesc, 0, SEEK_CUR) == table->f_pos);
+	curr_pos = table->f_pos;
+	
 	/* fill up [nodes] vector */
 	nodes = alloca(sizeof(ArrowFieldNode) * table->numFieldNodes);
 	for (i=0, j=0; i < table->nfields; i++)
@@ -1504,9 +1490,9 @@ writeArrowRecordBatch(SQLtable *table)
 	rbatch->buffers = buffers;
 	rbatch->_num_buffers = table->numBuffers;
 	/* serialization */
-	metaLength = writeFlatBufferMessage(table->fdesc, &message);
+	metaLength = writeFlatBufferMessage(table, &message);
 	for (j=0; j < table->nfields; j++)
-		writeArrowBuffer(table->fdesc, &table->columns[j]);
+		writeArrowBuffer(table, &table->columns[j]);
 
 	/* save the offset/length at ArrowBlock */
 	index = table->numRecordBatches++;
@@ -1517,7 +1503,7 @@ writeArrowRecordBatch(SQLtable *table)
 										sizeof(ArrowBlock) * (index+1));
 	block = &table->recordBatches[index];
 	initArrowNode(block, Block);
-	block->offset = currPos;
+	block->offset = curr_pos;
 	block->metaDataLength = metaLength;
 	block->bodyLength = bodyLength;
 
@@ -1532,7 +1518,7 @@ writeArrowRecordBatch(SQLtable *table)
 /*
  * writeArrowFooter
  */
-ssize_t
+void
 writeArrowFooter(SQLtable *table)
 {
 	ArrowFooter		footer;
@@ -1563,5 +1549,5 @@ writeArrowFooter(SQLtable *table)
 	footer._num_recordBatches = table->numRecordBatches;
 
 	/* serialization */
-	return writeFlatBufferFooter(table->fdesc, &footer);
+	return writeFlatBufferFooter(table, &footer);
 }

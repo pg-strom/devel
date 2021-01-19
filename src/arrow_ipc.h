@@ -130,6 +130,7 @@ struct SQLtable
 {
 	const char *filename;		/* output filename */
 	int			fdesc;			/* output file descriptor */
+	off_t		f_pos;			/* current file position */
 	ArrowBlock *recordBatches;	/* recordBatches written in the past */
 	int			numRecordBatches;
 	ArrowBlock *dictionaries;	/* dictionaryBatches written in the past */
@@ -168,10 +169,13 @@ struct SQLdictionary
 };
 
 /* arrow_write.c */
+extern void		arrowFileWrite(SQLtable *table,
+							   const char *buffer,
+							   ssize_t length);
 extern ssize_t	writeArrowSchema(SQLtable *table);
 extern void		writeArrowDictionaryBatches(SQLtable *table);
 extern int		writeArrowRecordBatch(SQLtable *table);
-extern ssize_t	writeArrowFooter(SQLtable *table);
+extern void		writeArrowFooter(SQLtable *table);
 extern size_t	estimateArrowBufferLength(SQLfield *column, size_t nitems);
 
 /* arrow_nodes.c */

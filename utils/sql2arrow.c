@@ -232,16 +232,14 @@ setup_append_file(SQLtable *table, ArrowFileInfo *af_info)
 
 	/* move to the file offset in front of the Footer portion */
 	nbytes = sizeof(int32_t) + 6;		/* strlen("ARROW1") */
-	offset = lseek(table->fdesc, -nbytes, SEEK_END);
-	if (offset < 0)
-		Elog("failed on lseek(%d, %zu, SEEK_END): %m",
-			 table->fdesc, sizeof(int32_t) + 6);
-	if (read(table->fdesc, buffer, nbytes) != nbytes)
-		Elog("failed on read(2): %m");
+	offset = af_info->stat_buf.st_size - nbytes;
+	if (pread(table->fdesc, buffer, nbytes, offset) != nbytes)
+		Elog("failed on pread(2): %m");
 	offset -= *((int32_t *)buffer);
 	if (lseek(table->fdesc, offset, SEEK_SET) < 0)
 		Elog("failed on lseek(%d, %zu, SEEK_SET): %m",
 			 table->fdesc, offset);
+	table->f_pos = offset;
 	length = af_info->stat_buf.st_size - offset;
 
 	/* makes Undo log to recover process termination */
@@ -283,7 +281,6 @@ static void
 setup_output_file(SQLtable *table, const char *output_filename)
 {
 	int		fdesc;
-	ssize_t	nbytes;
 
 	if (output_filename)
 	{
@@ -308,9 +305,7 @@ setup_output_file(SQLtable *table, const char *output_filename)
 				"        so a temporary file '%s' was built instead.\n", temp);
 	}
 	/* write out header stuff */
-	nbytes = write(table->fdesc, "ARROW1\0\0", 8);
-	if (nbytes != 8)
-		Elog("failed on write(2): %m");
+	arrowFileWrite(table, "ARROW1\0\0", 8);
 	writeArrowSchema(table);
 }
 

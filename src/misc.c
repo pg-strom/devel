@@ -1439,19 +1439,17 @@ __readFileSignal(int fdesc, void *buffer, size_t nbytes,
 
 	do {
 		rv = read(fdesc, (char *)buffer + count, nbytes - count);
-		if (rv < 0)
-		{
-			if (errno == EINTR)
-			{
-				if (interruptible)
-					CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			return rv;
-		}
+		if (rv > 0)
+			count += rv;
 		else if (rv == 0)
 			break;
-		count += rv;
+		else if (errno == EINTR)
+		{
+			if (interruptible)
+				CHECK_FOR_INTERRUPTS();
+		}
+		else
+			return rv;
 	} while (count < nbytes);
 
 	return count;
@@ -1464,6 +1462,26 @@ __readFile(int fdesc, void *buffer, size_t nbytes)
 }
 
 ssize_t
+__preadFile(int fdesc, void *buffer, size_t nbytes, off_t f_pos)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = pread(fdesc, (char *)buffer + count, nbytes - count, f_pos + count);
+		if (rv > 0)
+			count += rv;
+		else if (rv == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
 __writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
 				  bool interruptible)
 {
@@ -1471,19 +1489,17 @@ __writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
 
 	do {
 		rv = write(fdesc, (const char *)buffer + count, nbytes - count);
-		if (rv < 0)
-		{
-			if (errno == EINTR)
-			{
-				if (interruptible)
-					CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			return rv;
-		}
+		if (rv > 0)
+			count += rv;
 		else if (rv == 0)
 			break;
-		count += rv;
+		else if (errno == EINTR)
+		{
+			if (interruptible)
+				CHECK_FOR_INTERRUPTS();
+		}
+		else
+			return rv;
 	} while (count < nbytes);
 
 	return count;
@@ -1495,6 +1511,25 @@ __writeFile(int fdesc, const void *buffer, size_t nbytes)
 	return __writeFileSignal(fdesc, buffer, nbytes, true);
 }
 
+ssize_t
+__pwriteFile(int fdesc, const void *buffer, size_t nbytes, off_t f_pos)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = pwrite(fdesc, (const char *)buffer + count, nbytes - count, f_pos + count);
+		if (rv > 0)
+			count += rv;
+		else if (rv == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
+	} while (count < nbytes);
+
+	return count;
+}
 
 /*
  * mmap/munmap wrapper that is automatically unmapped on regarding to

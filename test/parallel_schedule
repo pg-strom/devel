@@ -30,7 +30,7 @@ test: dfunc_math dfunc_mbtext dexpr_scalar_array_op dexpr_misc
 # ----------
 # Test for arrow_fdw
 # ----------
-test: arrow_cpu arrow_write arrow_utils #arrow_python
+test: arrow_cpu arrow_write arrow_utils
 
 # ----------
 # Test for CPU fallback and GPU kernel suspend / resume

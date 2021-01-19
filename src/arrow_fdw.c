@@ -151,7 +151,6 @@ typedef struct
 	File		file;
 	MetadataCacheKey key;
 	uint32		hash;
-	bool		redo_log_written;
 	SQLtable	sql_table;
 } arrowWriteState;
 
@@ -239,7 +238,7 @@ static void		pg_datum_arrow_ref(kern_data_store *kds,
 /* routines for writable arrow_fdw foreign tables */
 static void	setupArrowSQLbufferSchema(SQLtable *table, TupleDesc tupdesc);
 static void setupArrowSQLbufferBatches(SQLtable *table);
-static void createArrowWriteRedoLog(File filp, bool is_newfile);
+static loff_t createArrowWriteRedoLog(File filp, bool is_newfile);
 static void writeOutArrowRecordBatch(arrowWriteState *aw_state,
 									 bool with_footer);
 
@@ -2072,30 +2071,35 @@ __ArrowBeginForeignModify(ResultRelInfo *rrinfo, int eflags)
 	arrowWriteState *aw_state;
 	SQLtable	   *table;
 	MetadataCacheKey key;
-	bool			redo_log_written = false;
+	off_t			f_pos;
+	bool			is_newfile = false;
 
 	Assert(list_length(filesList) == 1);
 	fname = strVal(linitial(filesList));
 
 	LockRelation(frel, ShareRowExclusiveLock);
-
 	filp = PathNameOpenFile(fname, O_RDWR | PG_BINARY);
-	if (filp < 0)
+	if (filp >= 0)
 	{
-		if (errno != ENOENT)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", fname)));
-
+		f_pos = createArrowWriteRedoLog(filp, false);
+	}
+	else if (errno != ENOENT)
+	{
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", fname)));
+	}
+	else
+	{
 		filp = PathNameOpenFile(fname, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
 		if (filp < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", fname)));
+		is_newfile = true;
 		PG_TRY();
 		{
-			createArrowWriteRedoLog(filp, true);
-			redo_log_written = true;
+			f_pos = createArrowWriteRedoLog(filp, true);
 		}
 		PG_CATCH();
 		{
@@ -2114,12 +2118,12 @@ __ArrowBeginForeignModify(ResultRelInfo *rrinfo, int eflags)
 	aw_state->file = filp;
 	aw_state->key = key;
 	aw_state->hash = key.hash;
-	aw_state->redo_log_written = redo_log_written;
 	table = &aw_state->sql_table;
 	table->filename = FilePathName(filp);
 	table->fdesc = FileGetRawDesc(filp);
+	table->f_pos = f_pos;
 	setupArrowSQLbufferSchema(table, tupdesc);
-	if (!redo_log_written)
+	if (!is_newfile)
 		setupArrowSQLbufferBatches(table);
 
 	rrinfo->ri_FdwState = aw_state;
@@ -4159,12 +4163,13 @@ setupArrowSQLbufferBatches(SQLtable *table)
 	if (lseek(table->fdesc, pos, SEEK_SET) < 0)
 		elog(ERROR, "failed on lseek('%s',%lu): %m",
 			 table->filename, pos);
+	table->f_pos = pos;
 }
 
 /*
  * createArrowWriteRedoLog
  */
-static void
+static loff_t
 createArrowWriteRedoLog(File filp, bool is_newfile)
 {
 	arrowWriteRedoLog *redo;
@@ -4190,8 +4195,7 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 			redo->xid    == curr_xid &&
 			redo->cid    <= curr_cid)
 		{
-			/* nothing to do */
-			return;
+			elog(ERROR, "Why? '%s' on behalf of arrow_fdw foreign-table is concurrently opened for update, please confirm the configuration", fname);
 		}
 	}
 
@@ -4206,6 +4210,8 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 		redo->pathname = (char *)redo + main_sz;
 		strcpy(redo->pathname, fname);
 		redo->is_truncate = false;
+		redo->footer_offset = 0;
+		redo->footer_length = 0;
 	}
 	else
 	{
@@ -4215,11 +4221,9 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 
 		/* make backup image of the Footer section */
 		nbytes = sizeof(int32) + 6;		/* = strlen("ARROW1") */
-		offset = lseek(fdesc, -nbytes, SEEK_END);
-		if (offset < 0)
-			elog(ERROR, "failed on lseek(2): %m");
-		if (__readFile(fdesc, temp, nbytes) != nbytes)
-			elog(ERROR, "failed on read(2): %m");
+		offset = stat_buf.st_size - nbytes;
+		if (__preadFile(fdesc, temp, nbytes, offset) != nbytes)
+			elog(ERROR, "failed on pread(2): %m");
 		offset -= *((int32 *)temp);
 
 		nbytes = stat_buf.st_size - offset;
@@ -4234,13 +4238,12 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 		redo->cid = curr_cid;
 		redo->pathname = (char *)redo + main_sz;
 		strcpy(redo->pathname, fname);
+		redo->is_truncate = false;
 		PG_TRY();
 		{
-			if (lseek(fdesc, -nbytes, SEEK_END) < 0)
-				elog(ERROR, "failed on lseek(2): %m");
-			if (__readFile(fdesc, redo->footer_backup, nbytes) != nbytes)
-				elog(ERROR, "failed on read(2): %m");
-			if (lseek(fdesc, -nbytes, SEEK_END) < 0)
+			if (__preadFile(fdesc, redo->footer_backup, nbytes, offset) != nbytes)
+				elog(ERROR, "failed on pread(2): %m");
+			if (lseek(fdesc, offset, SEEK_SET) < 0)
 				elog(ERROR, "failed on lseek(2): %m");
 			redo->footer_offset = offset;
 			redo->footer_length = nbytes;
@@ -4259,6 +4262,8 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 		 (uint64)redo->footer_length);
 
 	dlist_push_head(&arrow_write_redo_list, &redo->chain);
+
+	return redo->footer_offset;
 }
 
 /*
@@ -4269,8 +4274,6 @@ writeOutArrowRecordBatch(arrowWriteState *aw_state, bool with_footer)
 {
 	SQLtable   *table = &aw_state->sql_table;
 	int			index = aw_state->hash % ARROW_METADATA_HASH_NSLOTS;
-	struct stat	stat_buf;
-	ssize_t		nbytes;
 	arrowWriteMVCCLog *mvcc = NULL;
 
 	if (table->nitems > 0)
@@ -4286,23 +4289,10 @@ writeOutArrowRecordBatch(arrowWriteState *aw_state, bool with_footer)
 	{
 		LWLockAcquire(&arrow_metadata_state->lock_slots[index],
 					  LW_EXCLUSIVE);
-		/* get the latest state of the file */
-		if (fstat(table->fdesc, &stat_buf) != 0)
-			elog(ERROR, "failed on fstat('%s'): %m", table->filename);
-		/* make a REDO log entry */
-		if (!aw_state->redo_log_written)
-		{
-			createArrowWriteRedoLog(aw_state->file, false);
-			aw_state->redo_log_written = true;
-		}
 		/* write out an empty arrow file */
-		if (stat_buf.st_size == 0)
+		if (table->f_pos == 0)
 		{
-			Assert(lseek(table->fdesc, 0, SEEK_END) == 0);
-			nbytes = __writeFile(table->fdesc, "ARROW1\0\0", 8);
-			if (nbytes != 8)
-				elog(ERROR, "failed on __writeFile('%s'): %m",
-					 table->filename);
+			arrowFileWrite(table, "ARROW1\0\0", 8);
 			writeArrowSchema(table);
 		}
 		if (table->nitems > 0)
@@ -4361,7 +4351,6 @@ __arrowExecTruncateRelation(Relation frel)
 	const char *file_name;
 	size_t		main_sz;
 	int			fdesc = -1;
-	ssize_t		nbytes;
 	char		backup_path[MAXPGPATH];
 	bool		writable;
 
@@ -4434,9 +4423,7 @@ __arrowExecTruncateRelation(Relation frel)
 								 stat_buf.st_ino);
 			table->filename = path_name;
 			table->fdesc = fdesc;
-			nbytes = __writeFile(fdesc, "ARROW1\0\0", 8);
-			if (nbytes != 8)
-				elog(ERROR, "failed on __writeFile('%s'): %m", path_name);
+			arrowFileWrite(table, "ARROW1\0\0", 8);
 			writeArrowSchema(table);
 			writeArrowFooter(table);
 		}

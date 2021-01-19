@@ -1496,6 +1496,8 @@ extern ssize_t	__readFileSignal(int fdesc, void *buffer, size_t nbytes,
 								 bool interruptible);
 extern ssize_t	__writeFileSignal(int fdesc, const void *buffer, size_t nbytes,
 								  bool interruptible);
+extern ssize_t	__preadFile(int fdesc, void *buffer, size_t nbytes, off_t f_pos);
+extern ssize_t	__pwriteFile(int fdesc, const void *buffer, size_t nbytes, off_t f_pos);
 extern void	   *__mmapFile(void *addr, size_t length,
 						   int prot, int flags, int fdesc, off_t offset);
 extern int		__munmapFile(void *mmap_addr);
