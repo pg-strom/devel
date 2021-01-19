@@ -5,7 +5,19 @@
  */
 #ifndef _ARROW_DEFS_H_
 #define _ARROW_DEFS_H_
+#include <stdint.h>
 
+#ifndef __CUDACC__
+#ifndef bool
+typedef unsigned char	bool;
+#endif
+#ifndef true
+#define true	((bool) 1)
+#endif
+#ifndef false
+#define false	((bool) 0)
+#endif
+#endif
 /*
  * MetadataVersion : short
  */

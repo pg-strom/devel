@@ -475,7 +475,7 @@ form_kern_heaptuple(kern_context    *kcxt,
 					cl_char         *tup_dclass,	/* in */
 					Datum           *tup_values)	/* in */
 {
-	assert((uintptr_t)tupitem == MAXALIGN(tupitem));
+	assert((cl_ulong)tupitem == MAXALIGN(tupitem));
 	assert((char *)tupitem >= (char *)kds_dst &&
 		   (char *)tupitem <  (char *)kds_dst + kds_dst->length);
 	tupitem->rowid = UINT_MAX;		/* caller should set */

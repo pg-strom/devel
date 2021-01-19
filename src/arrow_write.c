@@ -6,25 +6,43 @@
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License. See the LICENSE file.
  */
+#ifdef __PGSTROM_MODULE__
 #include "postgres.h"
-#include <assert.h>
+#endif
 #include "arrow_ipc.h"
+
+/* alignment macros, if not */
+#ifndef SHORTALIGN
+#define SHORTALIGN(x)	TYPEALIGN(sizeof(uint16_t),(x))
+#endif
+#ifndef INTALIGN
+#define INTALIGN(x)		TYPEALIGN(sizeof(uint32_t),(x))
+#endif
+#ifndef LONGALIGN
+#define LONGALIGN(x)	TYPEALIGN(sizeof(uint64_t),(x))
+#endif
+#ifndef MAXALIGN
+#define MAXALIGN(x)		LONGALIGN(x)
+#endif
+#ifndef ARROWALIGN
+#define ARROWALIGN(x)	TYPEALIGN(64,(x))
+#endif
 
 typedef struct
 {
-	uint16		vlen;	/* vtable length */
-	uint16		tlen;	/* table length */
-	uint16		offset[FLEXIBLE_ARRAY_MEMBER];
+	uint16_t	vlen;	/* vtable length */
+	uint16_t	tlen;	/* table length */
+	uint16_t	offset[FLEXIBLE_ARRAY_MEMBER];
 } FBVtable;
 
 typedef struct
 {
 	void	  **extra_buf;		/* external buffer */
-	int32	   *extra_sz;		/* size of extra data */
-	uint16	   *extra_align;	/* alignment of extra data */
-	uint16		nattrs;			/* number of variables */
-	uint16		maxalign;		/* expected alignment of vtable base */
-	int32		length;			/* length of the flat image.
+	int32_t	   *extra_sz;		/* size of extra data */
+	uint16_t   *extra_align;	/* alignment of extra data */
+	uint16_t	nattrs;			/* number of variables */
+	uint16_t	maxalign;		/* expected alignment of vtable base */
+	int32_t		length;			/* length of the flat image.
 								 * If -1, buffer is not flatten yet. */
 	FBVtable	vtable;
 } FBTableBuf;
@@ -33,19 +51,19 @@ static FBTableBuf *
 __allocFBTableBuf(int nattrs, const char *func_name)
 {
 	FBTableBuf *buf;
-	size_t		required = (MAXALIGN(offsetof(FBTableBuf,
-											  vtable.offset[nattrs])) +
-							MAXALIGN(sizeof(int32) +
-									 sizeof(Datum) * nattrs));
-	buf = palloc0(required);
+	size_t		sz;
+
+	sz = (MAXALIGN(offsetof(FBTableBuf, vtable.offset[nattrs])) +
+		  MAXALIGN(sizeof(int32_t) + sizeof(uint64_t) * nattrs));
+	buf = palloc0(sz);
 	buf->extra_buf		= palloc0(sizeof(void *) * nattrs);
-	buf->extra_sz		= palloc0(sizeof(int32) * nattrs);
-	buf->extra_align	= palloc0(sizeof(uint16) * nattrs);
+	buf->extra_sz		= palloc0(sizeof(int32_t) * nattrs);
+	buf->extra_align	= palloc0(sizeof(uint16_t) * nattrs);
 	buf->nattrs			= nattrs;
-	buf->maxalign		= ALIGNOF_INT;
+	buf->maxalign		= sizeof(int32_t);
 	buf->length			= -1;	/* not flatten yet */
 	buf->vtable.vlen	= offsetof(FBVtable, offset[0]);
-	buf->vtable.tlen	= sizeof(int32);
+	buf->vtable.tlen	= sizeof(int32_t);
 
 	return buf;
 }
@@ -57,7 +75,7 @@ __addBufferScalar(FBTableBuf *buf, int index, void *ptr, int sz, int align)
 {
 	FBVtable   *vtable = &buf->vtable;
 
-	assert(sz >= 0 && sz <= sizeof(int64));
+	assert(sz >= 0 && sz <= sizeof(int64_t));
 	assert(index >= 0 && index < buf->nattrs);
 	if (!ptr || sz == 0)
 		vtable->offset[index] = 0;
@@ -66,15 +84,16 @@ __addBufferScalar(FBTableBuf *buf, int index, void *ptr, int sz, int align)
 		char   *table;
 		int		offset;
 
-		assert(buf->vtable.tlen >= sizeof(int32));
+		assert(buf->vtable.tlen >= sizeof(int32_t));
 		table = (char *)&buf->vtable + offsetof(FBVtable, offset[buf->nattrs]);
 		offset = TYPEALIGN(align, vtable->tlen);
 		memcpy(table + offset, ptr, sz);
 		vtable->offset[index] = offset;
 		vtable->tlen = offset + sz;
-		vtable->vlen = Max(vtable->vlen,
-						   offsetof(FBVtable, offset[index+1]));
-		buf->maxalign = Max(buf->maxalign, align);
+		if (vtable->vlen < offsetof(FBVtable, offset[index+1]))
+			vtable->vlen = offsetof(FBVtable, offset[index+1]);
+		if (buf->maxalign < align)
+			buf->maxalign = align;
 	}
 }
 
@@ -86,12 +105,12 @@ __addBufferBinary(FBTableBuf *buf, int index, void *ptr, int sz, int align)
 		buf->vtable.offset[index] = 0;
 	else
 	{
-		int32	zero = 0;
+		int32_t		zero = 0;
 
 		buf->extra_buf[index]	= ptr;
 		buf->extra_sz[index]	= sz;
 		buf->extra_align[index] = align;
-		__addBufferScalar(buf, index, &zero, sizeof(int32), ALIGNOF_INT);
+		__addBufferScalar(buf, index, &zero, sizeof(int32_t), sizeof(int32_t));
 	}
 }
 
@@ -103,14 +122,14 @@ addBufferOffset(FBTableBuf *buf, int index, FBTableBuf *sub)
 		buf->vtable.offset[index] = 0;
 	else
 	{
-		int32	shift = sub->vtable.vlen;
+		int32_t		shift = sub->vtable.vlen;
 
 		if (sub->length < 0)
 			Elog("Bug? FBTableBuf is not flatten");
 		buf->extra_buf[index]	= &sub->vtable;
 		buf->extra_sz[index]	= sub->length;
 		buf->extra_align[index]	= sub->maxalign;
-		__addBufferScalar(buf, index, &shift, sizeof(int32), ALIGNOF_INT);
+		__addBufferScalar(buf, index, &shift, sizeof(int32_t), sizeof(int32_t));
 	}
 }
 
@@ -123,7 +142,7 @@ __addBufferBool(FBTableBuf *buf, int index, bool value, bool __default)
 #define addBufferBool(a,b,c)		__addBufferBool((a),(b),(c),false)
 
 static inline void
-__addBufferChar(FBTableBuf *buf, int index, int8 value, int8 __default)
+__addBufferChar(FBTableBuf *buf, int index, int8_t value, int8_t __default)
 {
 	if (value != __default)
 		__addBufferScalar(buf, index, &value, sizeof(value), 1);
@@ -131,26 +150,26 @@ __addBufferChar(FBTableBuf *buf, int index, int8 value, int8 __default)
 #define addBufferChar(a,b,c)		__addBufferChar((a),(b),(c),0)
 
 static inline void
-__addBufferShort(FBTableBuf *buf, int index, int16 value, int16 __default)
+__addBufferShort(FBTableBuf *buf, int index, int16_t value, int16_t __default)
 {
 	if (value != __default)
-		__addBufferScalar(buf, index, &value, sizeof(value), ALIGNOF_SHORT);
+		__addBufferScalar(buf, index, &value, sizeof(value), sizeof(int16_t));
 }
 #define addBufferShort(a,b,c)		__addBufferShort((a),(b),(c),0)
 
 static inline void
-__addBufferInt(FBTableBuf *buf, int index, int32 value, int32 __default)
+__addBufferInt(FBTableBuf *buf, int index, int32_t value, int32_t __default)
 {
 	if (value != __default)
-		__addBufferScalar(buf, index, &value, sizeof(value), ALIGNOF_INT);
+		__addBufferScalar(buf, index, &value, sizeof(value), sizeof(int32_t));
 }
 #define addBufferInt(a,b,c)			__addBufferInt((a),(b),(c),0)
 
 static inline void
-__addBufferLong(FBTableBuf *buf, int index, int64 value, int64 __default)
+__addBufferLong(FBTableBuf *buf, int index, int64_t value, int64_t __default)
 {
 	if (value != __default)
-		__addBufferScalar(buf, index, &value, sizeof(value), ALIGNOF_LONG);
+		__addBufferScalar(buf, index, &value, sizeof(value), sizeof(int64_t));
 }
 #define addBufferLong(a,b,c)		__addBufferLong((a),(b),(c),0)
 
@@ -162,21 +181,21 @@ addBufferString(FBTableBuf *buf, int index, const char *cstring)
 
 	if (cstring && (slen = strlen(cstring)) > 0)
 	{
-		blen = sizeof(int32) + INTALIGN(slen + 1);
+		blen = sizeof(int32_t) + INTALIGN(slen + 1);
 		temp = palloc0(blen);
-		*((int32 *)temp) = slen;
-		strcpy(temp + sizeof(int32), cstring);
-		__addBufferBinary(buf, index, temp, blen, ALIGNOF_INT);
+		*((int32_t *)temp) = slen;
+		strcpy(temp + sizeof(int32_t), cstring);
+		__addBufferBinary(buf, index, temp, blen, sizeof(int32_t));
 	}
 }
 
 static void
 addBufferVector(FBTableBuf *buf, int index, int nitems, FBTableBuf **elements)
 {
-	size_t	len = MAXALIGN(sizeof(int32) + sizeof(int32) * nitems);
-	int32	i, *vector;
+	size_t	len = MAXALIGN(sizeof(int32_t) + sizeof(int32_t) * nitems);
+	int32_t	i, *vector;
 	char   *pos;
-	int		maxalign = ALIGNOF_INT;
+	int		maxalign = sizeof(int32_t);
 
 	/* calculation of flat buffer length */
 	for (i=0; i < nitems; i++)
@@ -205,7 +224,8 @@ addBufferVector(FBTableBuf *buf, int index, int nitems, FBTableBuf **elements)
 		vector[i+1] = (pos + e->vtable.vlen) - (char *)&vector[i+1];
 		pos += e->length;
 
-		maxalign = Max(maxalign, e->maxalign);
+		if (maxalign < e->maxalign)
+			maxalign = e->maxalign;
 	}
 	__addBufferBinary(buf, index, vector, pos - (char *)vector, maxalign);
 }
@@ -219,7 +239,7 @@ __makeBufferFlatten(FBTableBuf *buf, const char *func_name)
 
 	assert(vtable->vlen == SHORTALIGN(vtable->vlen) &&
 		   vtable->vlen <= offsetof(FBVtable, offset[buf->nattrs]));
-	assert(vtable->tlen >= sizeof(int32));
+	assert(vtable->tlen >= sizeof(int32_t));
 
 	/* close up the hole between vtable tail and table head if any */
 	if (buf->vtable.vlen != offsetof(FBVtable, offset[buf->nattrs]))
@@ -228,7 +248,7 @@ __makeBufferFlatten(FBTableBuf *buf, const char *func_name)
 				(char *)vtable + offsetof(FBVtable, offset[buf->nattrs]),
 				vtable->tlen);
 	}
-	*((int32 *)((char *)vtable + vtable->vlen)) = vtable->vlen;
+	*((int32_t *)((char *)vtable + vtable->vlen)) = vtable->vlen;
 
 	/* check extra buffer usage */
 	for (i=0; i < buf->nattrs; i++)
@@ -242,7 +262,7 @@ __makeBufferFlatten(FBTableBuf *buf, const char *func_name)
 	else
 	{
 		char	   *base;
-		int32	   *offset;
+		int32_t	   *offset;
 		size_t		usage, gap;
 
 		buf = repalloc(buf, (offsetof(FBTableBuf, vtable) +
@@ -258,7 +278,7 @@ __makeBufferFlatten(FBTableBuf *buf, const char *func_name)
 			assert(buf->extra_sz[i] > 0);
 			assert(buf->extra_align[i] > 0);
 			assert(vtable->offset[i] != 0);
-			offset = (int32 *)(base + vtable->offset[i]);
+			offset = (int32_t *)(base + vtable->offset[i]);
 			gap = TYPEALIGN(buf->extra_align[i],
 							usage + *offset) - (usage + *offset);
 			if (gap > 0)
@@ -276,6 +296,49 @@ __makeBufferFlatten(FBTableBuf *buf, const char *func_name)
 }
 
 #define makeBufferFlatten(a)	__makeBufferFlatten((a),__FUNCTION__)
+
+/*
+ * sql_buffer_write
+ */
+static void
+sql_buffer_write(int fdesc, SQLbuffer *buf)
+{
+	ssize_t		length = buf->usage;
+	ssize_t		offset = 0;
+	ssize_t		nbytes;
+
+	while (offset < length)
+	{
+		nbytes = write(fdesc, buf->data + offset, length - offset);
+		if (nbytes < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			Elog("failed on write(2): %m");
+		}
+		offset += nbytes;
+	}
+
+	if (length != ARROWALIGN(length))
+	{
+		ssize_t	gap = ARROWALIGN(length) - length;
+		char	zero[64];
+
+		offset = 0;
+		memset(zero, 0, sizeof(zero));
+		while (offset < gap)
+		{
+			nbytes = write(fdesc, zero + offset, gap - offset);
+			if (nbytes < 0)
+			{
+				if (errno == EINTR)
+					continue;
+				Elog("failed on write(2): %m");
+			}
+			offset += nbytes;
+		}
+	}
+}
 
 /*
  * Arrow v0.15 didn't allow Filed->type is null object, even if type has
@@ -379,14 +442,14 @@ createArrowTypeUnion(ArrowTypeUnion *node)
 	addBufferShort(buf, 0, node->mode);
 	if (node->_num_typeIds > 0)
 	{
-		size_t	sz = sizeof(int32) * (node->_num_typeIds + 1);
-		int32  *vector = alloca(sz);
-		int		i;
+		size_t		sz = sizeof(int32_t) * (node->_num_typeIds + 1);
+		int32_t	   *vector = alloca(sz);
+		int			i;
 
 		vector[0] = node->_num_typeIds;
 		for (i=0; i < node->_num_typeIds; i++)
 			vector[i+1] = node->typeIds[i];
-		__addBufferBinary(buf, 1, vector, sz, ALIGNOF_INT);
+		__addBufferBinary(buf, 1, vector, sz, sizeof(int32_t));
 	}
 	return makeBufferFlatten(buf);
 }
@@ -510,10 +573,10 @@ createArrowType(ArrowType *node, ArrowTypeTag *p_type_tag)
 
 struct ArrowBufferVector
 {
-	int32		nitems;
+	int32_t			nitems;
 	struct {
-		int64	offset;
-		int64	length;
+		int64_t		offset;
+		int64_t		length;
 	} buffers[FLEXIBLE_ARRAY_MEMBER];
 } __attribute__((packed));
 typedef struct ArrowBufferVector	ArrowBufferVector;
@@ -536,15 +599,15 @@ addBufferArrowBufferVector(FBTableBuf *buf, int index,
 		vector->buffers[i].offset = b->offset;
 		vector->buffers[i].length = b->length;
 	}
-	__addBufferBinary(buf, index, vector, sz, ALIGNOF_LONG);
+	__addBufferBinary(buf, index, vector, sz, sizeof(int64_t));
 }
 
 struct ArrowFieldNodeVector
 {
-	int32		nitems;
+	int32_t			nitems;
 	struct {
-		int64	length;
-		int64	null_count;
+		int64_t		length;
+		int64_t		null_count;
 	} nodes[FLEXIBLE_ARRAY_MEMBER];
 } __attribute__((packed));
 typedef struct ArrowFieldNodeVector	ArrowFieldNodeVector;
@@ -567,7 +630,7 @@ addBufferArrowFieldNodeVector(FBTableBuf *buf, int index,
 		vector->nodes[i].length		= f->length;
 		vector->nodes[i].null_count	= f->null_count;
 	}
-	__addBufferBinary(buf, index, vector, sz, ALIGNOF_LONG);
+	__addBufferBinary(buf, index, vector, sz, sizeof(int64_t));
 }
 
 static FBTableBuf *
@@ -735,12 +798,12 @@ createArrowMessage(ArrowMessage *node)
 
 struct ArrowBlockVector
 {
-	int32		nitems;
+	int32_t			nitems;
 	struct {
-		int64	offset;
-		int32	metaDataLength;
-		int32	__padding__;
-		int64	bodyLength;
+		int64_t		offset;
+		int32_t		metaDataLength;
+		int32_t		__padding__;
+		int64_t		bodyLength;
 	} blocks[FLEXIBLE_ARRAY_MEMBER];
 } __attribute__((packed));
 typedef struct ArrowBlockVector		ArrowBlockVector;
@@ -764,7 +827,7 @@ addBufferArrowBlockVector(FBTableBuf *buf, int index,
 		vector->blocks[i].metaDataLength = b->metaDataLength;
 		vector->blocks[i].bodyLength = b->bodyLength;
 	}
-	__addBufferBinary(buf, index, vector, sz, ALIGNOF_LONG);
+	__addBufferBinary(buf, index, vector, sz, sizeof(int64_t));
 }
 
 static FBTableBuf *
@@ -795,9 +858,9 @@ createArrowFooter(ArrowFooter *node)
  */
 typedef struct
 {
-	int32		continuation;
-	int32		metaLength;
-	int32		rootOffset;
+	int32_t		continuation;
+	int32_t		metaLength;
+	int32_t		rootOffset;
 	char		data[FLEXIBLE_ARRAY_MEMBER];
 } FBMessageFileImage;
 
@@ -820,7 +883,7 @@ writeFlatBufferMessage(int fdesc, ArrowMessage *message)
 	memset(image, 0, length);
 	image->continuation = 0xffffffff;
 	image->metaLength = length - offsetof(FBMessageFileImage, rootOffset);
-	image->rootOffset = sizeof(int32) + offset;
+	image->rootOffset = sizeof(int32_t) + offset;
 	memcpy(image->data + gap, &payload->vtable, payload->length);
 
 	offset = 0;
@@ -843,13 +906,13 @@ writeFlatBufferMessage(int fdesc, ArrowMessage *message)
  */
 typedef struct
 {
-	int32		rootOffset;
+	int32_t		rootOffset;
 	char		data[FLEXIBLE_ARRAY_MEMBER];
 } FBFooterFileImage;
 
 typedef struct
 {
-	int32		metaOffset;
+	int32_t		metaOffset;
 	char		signature[6];
 } FBFooterTailImage;
 
@@ -862,11 +925,11 @@ writeFlatBufferFooter(int fdesc, ArrowFooter *footer)
 	ssize_t		nbytes;
 	ssize_t		offset;
 	ssize_t		length;
-	uint64		eos = 0xffffffffUL;
+	uint64_t	eos = 0xffffffffUL;
 
 	/* put EOS and ensure 64bit alignment */
-	nbytes = write(fdesc, &eos, sizeof(uint64));
-	if (nbytes != sizeof(uint64))
+	nbytes = write(fdesc, &eos, sizeof(uint64_t));
+	if (nbytes != sizeof(uint64_t))
 		Elog("failed on write: %m");
 
 	assert(payload->length > 0);
@@ -875,7 +938,7 @@ writeFlatBufferFooter(int fdesc, ArrowFooter *footer)
 	length = (offsetof(FBFooterFileImage, data[nbytes]) +
 			  offsetof(FBFooterTailImage, signature[6]));
 	image = alloca(length + 1);
-	image->rootOffset = sizeof(int32) + INTALIGN(payload->vtable.vlen);
+	image->rootOffset = sizeof(int32_t) + INTALIGN(payload->vtable.vlen);
 	if (offset > 0)
 		memset(image->data, 0, offset);
     memcpy(image->data + offset, &payload->vtable, payload->length);
@@ -883,7 +946,7 @@ writeFlatBufferFooter(int fdesc, ArrowFooter *footer)
 	if (offset < nbytes)
 		memset(image->data + offset, 0, nbytes - offset);
 	tail = (FBFooterTailImage *)(image->data + nbytes);
-	tail->metaOffset = nbytes + sizeof(int32);
+	tail->metaOffset = nbytes + sizeof(int32_t);
 	strcpy(tail->signature, "ARROW1");
 	if (write(fdesc, image, length) != length)
 		Elog("failed on write: %m");
@@ -946,7 +1009,7 @@ writeArrowSchema(SQLtable *table)
 {
 	ArrowMessage	message;
 	ArrowSchema	   *schema;
-	int32			i;
+	int				i;
 
 	/* setup Message of Schema */
 	initArrowNode(&message, Message);
@@ -1390,7 +1453,7 @@ writeArrowRecordBatch(SQLtable *table)
 	ArrowFieldNode *nodes;
 	ArrowBuffer	   *buffers;
 	ArrowBlock	   *block;
-	int32			i, j;
+	int				i, j;
 	int				index;
 	off_t			currPos;
 	size_t			metaLength;
@@ -1403,8 +1466,8 @@ writeArrowRecordBatch(SQLtable *table)
 		Elog("unable to get current position of the file");
 	if (currPos != LONGALIGN(currPos))
 	{
-		uint64  zero = 0;
-		size_t  gap = LONGALIGN(currPos) - currPos;
+		uint64_t	zero = 0;
+		size_t 		gap = LONGALIGN(currPos) - currPos;
 
 		if (write(table->fdesc, &zero, gap) != gap)
 			Elog("unable to fill up alignment gap: %m");

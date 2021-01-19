@@ -1,6 +1,6 @@
 #ifndef SQL2ARROW_H
 #define SQL2ARROW_H
-#include "postgres.h"
+//#include "postgres.h"
 #include "arrow_ipc.h"
 
 typedef struct userConfigOption     userConfigOption;
@@ -29,10 +29,10 @@ extern void
 sqldb_close_connection(void *sqldb_state);
 
 /* misc functions */
-extern void	   *palloc(Size sz);
-extern void	   *palloc0(Size sz);
+extern void	   *palloc(size_t sz);
+extern void	   *palloc0(size_t sz);
 extern char	   *pstrdup(const char *str);
-extern void	   *repalloc(void *ptr, Size sz);
-extern Datum	hash_any(const unsigned char *k, int keylen);
+extern void	   *repalloc(void *ptr, size_t sz);
+extern uint64_t	hash_any(const unsigned char *k, int keylen);
 
 #endif	/* SQL2ARROW_H */

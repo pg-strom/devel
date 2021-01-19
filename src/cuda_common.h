@@ -64,9 +64,6 @@ typedef unsigned short		cl_half;
 #endif	/* __CUDACC__ */
 typedef float				cl_float;
 typedef double				cl_double;
-#ifdef __CUDACC__
-typedef cl_ulong			uintptr_t;
-#endif
 
 #define CL_SHORT_NBITS		(sizeof(cl_short) * BITS_PER_BYTE)
 #define CL_INT_NBITS		(sizeof(cl_int) * BITS_PER_BYTE)
@@ -234,9 +231,9 @@ typedef struct nameData
  * Alignment macros
  */
 #define TYPEALIGN(ALIGNVAL,LEN)	\
-	(((uintptr_t) (LEN) + ((ALIGNVAL) - 1)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
+	(((cl_ulong) (LEN) + ((ALIGNVAL) - 1)) & ~((cl_ulong) ((ALIGNVAL) - 1)))
 #define TYPEALIGN_DOWN(ALIGNVAL,LEN) \
-	(((uintptr_t) (LEN)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
+	(((cl_ulong) (LEN)) & ~((cl_ulong) ((ALIGNVAL) - 1)))
 #define INTALIGN(LEN)			TYPEALIGN(sizeof(cl_int), (LEN))
 #define INTALIGN_DOWN(LEN)		TYPEALIGN_DOWN(sizeof(cl_int), (LEN))
 #define LONGALIGN(LEN)          TYPEALIGN(sizeof(cl_long), (LEN))

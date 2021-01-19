@@ -17,8 +17,17 @@
  */
 #ifndef ARROW_IPC_H
 #define ARROW_IPC_H
+#ifdef __PGSTROM_MODULE__
+#include "pg_strom.h"
+#endif
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -27,7 +36,23 @@
 
 #include "arrow_defs.h"
 
-#define	ARROWALIGN(LEN)			TYPEALIGN(64, (LEN))
+/* several primitive definitions */
+#ifndef offsetof
+//#define offsetof(type,field)		((long) &((type *)0UL)->field)
+#endif
+#ifndef lengthof
+//#define lengthof(array)				(sizeof(array) / sizeof((array)[0]))
+#endif
+
+#ifndef TYPEALIGN
+#define TYPEALIGN(ALIGNVAL,LEN)					\
+	(((uint64_t)(LEN) + ((ALIGNVAL) - 1)) & ~((uint64_t)((ALIGNVAL) - 1)))
+#endif
+#define ARROWALIGN(LEN)			TYPEALIGN(64,(LEN))
+
+#ifndef Oid
+typedef unsigned int	Oid;
+#endif
 
 typedef struct SQLbuffer		SQLbuffer;
 typedef struct SQLtable			SQLtable;
@@ -40,8 +65,8 @@ typedef struct SQLtype__mysql	SQLtype__mysql;
 struct SQLbuffer
 {
 	char	   *data;
-	uint32		usage;
-	uint32		length;
+	uint32_t	usage;
+	uint32_t	length;
 };
 
 struct SQLtype__pgsql
@@ -53,7 +78,7 @@ struct SQLtype__pgsql
 	short		typlen;
 	bool		typbyval;
 	char		typtype;
-	uint8		typalign;
+	uint8_t		typalign;
 };
 
 struct SQLtype__mysql
@@ -97,6 +122,10 @@ sql_field_put_value(SQLfield *column, const char *addr, int sz)
 	return (column->__curr_usage__ = column->put_value(column, addr, sz));
 }
 
+#ifndef FLEXIBLE_ARRAY_MEMBER
+#define FLEXIBLE_ARRAY_MEMBER
+#endif
+
 struct SQLtable
 {
 	const char *filename;		/* output filename */
@@ -120,16 +149,16 @@ typedef struct hashItem		hashItem;
 struct hashItem
 {
 	struct hashItem	*next;
-	uint32		hash;
-	uint32		index;
-	uint32		label_sz;
+	uint32_t	hash;
+	uint32_t	index;
+	uint32_t	label_sz;
 	char		label[FLEXIBLE_ARRAY_MEMBER];
 };
 
 struct SQLdictionary
 {
 	struct SQLdictionary *next;
-	int64		dict_id;
+	int64_t		dict_id;
 	SQLbuffer	values;
 	SQLbuffer	extra;
 	int			nloaded;	/* # of items loaded from existing file */
@@ -186,10 +215,10 @@ extern int		assignArrowTypePgSQL(SQLfield *column,
 /*
  * SQLbuffer related routines
  */
-extern void	   *palloc(Size sz);
-extern void	   *palloc0(Size sz);
+extern void	   *palloc(size_t sz);
+extern void	   *palloc0(size_t sz);
 extern char	   *pstrdup(const char *orig);
-extern void	   *repalloc(void *ptr, Size sz);
+extern void	   *repalloc(void *ptr, size_t sz);
 
 static inline void
 sql_buffer_init(SQLbuffer *buf)
@@ -258,8 +287,9 @@ sql_buffer_setbit(SQLbuffer *buf, size_t __index)
 	int			mask  = (1 << (__index & 7));
 
 	sql_buffer_expand(buf, index + 1);
-	((uint8 *)buf->data)[index] |= mask;
-	buf->usage = Max(buf->usage, index + 1);
+	((uint8_t *)buf->data)[index] |= mask;
+	if (buf->usage < index + 1)
+		buf->usage = index + 1;
 }
 
 static inline void
@@ -269,8 +299,9 @@ sql_buffer_clrbit(SQLbuffer *buf, size_t __index)
 	int			mask  = (1 << (__index & 7));
 
 	sql_buffer_expand(buf, index + 1);
-	((uint8 *)buf->data)[index] &= ~mask;
-	buf->usage = Max(buf->usage, index + 1);
+	((uint8_t *)buf->data)[index] &= ~mask;
+	if (buf->usage < index + 1)
+		buf->usage = index + 1;
 }
 
 static inline void
@@ -291,50 +322,4 @@ sql_buffer_copy(SQLbuffer *dest, const SQLbuffer *orig)
 		dest->usage = orig->usage;
 	}
 }
-
-static inline void
-sql_buffer_write(int fdesc, SQLbuffer *buf)
-{
-	ssize_t		length = buf->usage;
-	ssize_t		offset = 0;
-	ssize_t		nbytes;
-
-	while (offset < length)
-	{
-		nbytes = write(fdesc, buf->data + offset, length - offset);
-		if (nbytes < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			Elog("failed on write(2): %m");
-		}
-		offset += nbytes;
-	}
-
-	if (length != ARROWALIGN(length))
-	{
-		ssize_t	gap = ARROWALIGN(length) - length;
-		char	zero[64];
-
-		offset = 0;
-		memset(zero, 0, sizeof(zero));
-		while (offset < gap)
-		{
-			nbytes = write(fdesc, zero + offset, gap - offset);
-			if (nbytes < 0)
-			{
-				if (errno == EINTR)
-					continue;
-				Elog("failed on write(2): %m");
-			}
-			offset += nbytes;
-		}
-	}
-}
-
-/*
- * Misc functions
- */
-//extern Datum hash_any(const unsigned char *k, int keylen);
-
 #endif	/* ARROW_IPC_H */

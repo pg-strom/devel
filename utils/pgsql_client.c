@@ -32,8 +32,8 @@ typedef struct
 {
 	PGconn	   *conn;
 	PGresult   *res;
-	uint32		nitems;
-	uint32		index;
+	uint32_t	nitems;
+	uint32_t	index;
 } PGSTATE;
 
 static inline bool
@@ -162,7 +162,7 @@ pgsql_create_dictionary(PGconn *conn, SQLtable *root,
 	PGresult   *res;
 	char		query[4096];
 	int			i, nitems;
-	int64		dict_id = enum_typeid;
+	int64_t		dict_id = enum_typeid;
 
 	if (arrow_field)
 	{
@@ -200,7 +200,7 @@ pgsql_create_dictionary(PGconn *conn, SQLtable *root,
 	{
 		const char *enumlabel = PQgetvalue(res, i, 0);
 		hashItem   *hitem;
-		uint32		hash, hindex;
+		uint32_t	hash, hindex;
 		size_t		sz;
 
 		if (PQgetisnull(res, i, 0) != 0)
@@ -230,9 +230,9 @@ pgsql_create_dictionary(PGconn *conn, SQLtable *root,
 
 			sql_buffer_append(&dict->extra, enumlabel, sz);
 			if (dict->values.usage == 0)
-				sql_buffer_append_zero(&dict->values, sizeof(uint32));
+				sql_buffer_append_zero(&dict->values, sizeof(uint32_t));
 			sql_buffer_append(&dict->values,
-							  &dict->extra.usage, sizeof(uint32));
+							  &dict->extra.usage, sizeof(uint32_t));
 		}
 	}
 	PQclear(res);
@@ -697,13 +697,4 @@ sqldb_close_connection(void *sqldb_state)
 	PQclear(res);
 	/* close the connection */
 	PQfinish(conn);
-}
-
-/*
- * Misc functions
- */
-void *
-MemoryContextAlloc(MemoryContext context, Size sz)
-{
-	return palloc(sz);
 }

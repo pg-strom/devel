@@ -16,14 +16,22 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
+/*
 #include "postgres.h"
 #include "port/pg_bswap.h"
 #include "utils/date.h"
 #include "utils/timestamp.h"
+*/
+#include <stdarg.h>
 #include "arrow_ipc.h"
 
 static void		sql_buffer_printf(SQLbuffer *buf, const char *fmt, ...)
-					pg_attribute_printf(2,3);
+#ifdef pg_attribute_printf
+	pg_attribute_printf(2,3)
+#elif defined(__GNUC__)
+	__attribute__((format(gnu_printf, 2, 3)))
+#endif
+	;
 
 /*
  * Dump support of ArrowNode
@@ -586,8 +594,8 @@ __copyArrowTypeUnion(ArrowTypeUnion *dest, const ArrowTypeUnion *src)
 {
 	__copyArrowNode(&dest->node, &src->node);
 	COPY_SCALAR(mode);
-	dest->typeIds = palloc(sizeof(int32) * src->_num_typeIds);
-	memcpy(dest->typeIds, src->typeIds, sizeof(int32) * src->_num_typeIds);
+	dest->typeIds = palloc(sizeof(int32_t) * src->_num_typeIds);
+	memcpy(dest->typeIds, src->typeIds, sizeof(int32_t) * src->_num_typeIds);
 	dest->_num_typeIds = src->_num_typeIds;
 }
 
@@ -964,14 +972,14 @@ __initArrowNode(ArrowNode *node, ArrowNodeTag tag)
 /* table/vtable of FlatBuffer */
 typedef struct
 {
-	uint16		vlen;	/* vtable length */
-	uint16		tlen;	/* table length */
-	uint16		offset[FLEXIBLE_ARRAY_MEMBER];
+	uint16_t	vlen;	/* vtable length */
+	uint16_t	tlen;	/* table length */
+	uint16_t	offset[FLEXIBLE_ARRAY_MEMBER];
 } FBVtable;
 
 typedef struct
 {
-	int32	   *table;
+	int32_t	   *table;
 	FBVtable   *vtable;
 } FBTable;
 
@@ -980,7 +988,7 @@ fetchFBTable(void *p_table)
 {
 	FBTable		t;
 
-	t.table  = (int32 *)p_table;
+	t.table  = (int32_t *)p_table;
 	t.vtable = (FBVtable *)((char *)p_table - *t.table);
 
 	return t;
@@ -993,7 +1001,7 @@ __fetchPointer(FBTable *t, int index)
 
 	if (offsetof(FBVtable, offset[index]) < vtable->vlen)
 	{
-		uint16		offset = vtable->offset[index];
+		uint16_t	offset = vtable->offset[index];
 
 		assert(offset < vtable->tlen);
 		if (offset)
@@ -1009,47 +1017,47 @@ fetchBool(FBTable *t, int index)
 	return (ptr ? *ptr : false);
 }
 
-static inline int8
+static inline int8_t
 fetchChar(FBTable *t, int index)
 {
-	int8	   *ptr = __fetchPointer(t, index);
+	int8_t	   *ptr = __fetchPointer(t, index);
 	return (ptr ? *ptr : 0);
 }
 
-static inline int16
+static inline int16_t
 fetchShort(FBTable *t, int index)
 {
-	int16	  *ptr = __fetchPointer(t, index);
+	int16_t	  *ptr = __fetchPointer(t, index);
 	return (ptr ? *ptr : 0);
 }
 
-static inline int32
+static inline int32_t
 fetchInt(FBTable *t, int index)
 {
-	int32	  *ptr = __fetchPointer(t, index);
+	int32_t	  *ptr = __fetchPointer(t, index);
 	return (ptr ? *ptr : 0);
 }
 
-static inline int64
+static inline int64_t
 fetchLong(FBTable *t, int index)
 {
-	int64	  *ptr = __fetchPointer(t, index);
+	int64_t	  *ptr = __fetchPointer(t, index);
 	return (ptr ? *ptr : 0);
 }
 
 static inline void *
 fetchOffset(FBTable *t, int index)
 {
-	int32  *ptr = __fetchPointer(t, index);
+	int32_t	   *ptr = __fetchPointer(t, index);
 	return (ptr ? (char *)ptr + *ptr : NULL);
 }
 
 static inline const char *
 fetchString(FBTable *t, int index, int *p_strlen)
 {
-	int32  *ptr = fetchOffset(t, index);
-	int32	len = 0;
-	char   *temp;
+	int32_t	   *ptr = fetchOffset(t, index);
+	int32_t		len = 0;
+	char	   *temp;
 
 	if (!ptr)
 		temp = NULL;
@@ -1064,10 +1072,10 @@ fetchString(FBTable *t, int index, int *p_strlen)
 	return temp;
 }
 
-static inline int32 *
+static inline int32_t *
 fetchVector(FBTable *t, int index, int *p_nitems)
 {
-	int32  *vector = fetchOffset(t, index);
+	int32_t	   *vector = fetchOffset(t, index);
 
 	if (!vector)
 		*p_nitems = 0;
@@ -1079,7 +1087,7 @@ fetchVector(FBTable *t, int index, int *p_nitems)
 static void
 readArrowKeyValue(ArrowKeyValue *kv, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *)pos);
+	FBTable		t = fetchFBTable((int32_t *)pos);
 
 	memset(kv, 0, sizeof(ArrowKeyValue));
 	INIT_ARROW_NODE(kv, KeyValue);
@@ -1090,7 +1098,7 @@ readArrowKeyValue(ArrowKeyValue *kv, const char *pos)
 static void
 readArrowTypeInt(ArrowTypeInt *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->bitWidth  = fetchInt(&t, 0);
 	node->is_signed = fetchBool(&t, 1);
@@ -1102,7 +1110,7 @@ readArrowTypeInt(ArrowTypeInt *node, const char *pos)
 static void
 readArrowTypeFloatingPoint(ArrowTypeFloatingPoint *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->precision = fetchShort(&t, 0);
 	if (node->precision != ArrowPrecision__Half &&
@@ -1115,7 +1123,7 @@ readArrowTypeFloatingPoint(ArrowTypeFloatingPoint *node, const char *pos)
 static void
 readArrowTypeDecimal(ArrowTypeDecimal *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->precision = fetchInt(&t, 0);
 	node->scale     = fetchInt(&t, 1);
@@ -1124,8 +1132,8 @@ readArrowTypeDecimal(ArrowTypeDecimal *node, const char *pos)
 static void
 readArrowTypeDate(ArrowTypeDate *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
-	int16	   *ptr;
+	FBTable		t = fetchFBTable((int32_t *) pos);
+	int16_t	   *ptr;
 
 	/* Date->unit has non-zero default value */
 	ptr = __fetchPointer(&t, 0);
@@ -1138,7 +1146,7 @@ readArrowTypeDate(ArrowTypeDate *node, const char *pos)
 static void
 readArrowTypeTime(ArrowTypeTime *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->unit = fetchShort(&t, 0);
 	node->bitWidth = fetchInt(&t, 1);
@@ -1164,7 +1172,7 @@ readArrowTypeTime(ArrowTypeTime *node, const char *pos)
 static void
 readArrowTypeTimestamp(ArrowTypeTimestamp *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->unit = fetchShort(&t, 0);
 	node->timezone = fetchString(&t, 1, &node->_timezone_len);
@@ -1178,7 +1186,7 @@ readArrowTypeTimestamp(ArrowTypeTimestamp *node, const char *pos)
 static void
 readArrowTypeInterval(ArrowTypeInterval *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->unit = fetchShort(&t, 0);
 	if (node->unit != ArrowIntervalUnit__Year_Month &&
@@ -1189,9 +1197,9 @@ readArrowTypeInterval(ArrowTypeInterval *node, const char *pos)
 static void
 readArrowTypeUnion(ArrowTypeUnion *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
-	int32	   *vector;
-	int32		nitems;
+	FBTable		t = fetchFBTable((int32_t *) pos);
+	int32_t	   *vector;
+	int32_t		nitems;
 
 	node->mode = fetchShort(&t, 0);
 	vector = fetchVector(&t, 1, &nitems);
@@ -1199,8 +1207,8 @@ readArrowTypeUnion(ArrowTypeUnion *node, const char *pos)
 		node->typeIds = NULL;
 	else
 	{
-		node->typeIds = palloc0(sizeof(int32) * nitems);
-		memcpy(node->typeIds, vector, sizeof(int32) * nitems);
+		node->typeIds = palloc0(sizeof(int32_t) * nitems);
+		memcpy(node->typeIds, vector, sizeof(int32_t) * nitems);
 	}
 	node->_num_typeIds = nitems;
 }
@@ -1208,7 +1216,7 @@ readArrowTypeUnion(ArrowTypeUnion *node, const char *pos)
 static void
 readArrowTypeFixedSizeBinary(ArrowTypeFixedSizeBinary *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->byteWidth = fetchInt(&t, 0);
 }
@@ -1216,7 +1224,7 @@ readArrowTypeFixedSizeBinary(ArrowTypeFixedSizeBinary *node, const char *pos)
 static void
 readArrowTypeFixedSizeList(ArrowTypeFixedSizeList *node, const char *pos)
 {
-	FBTable		t= fetchFBTable((int32 *) pos);
+	FBTable		t= fetchFBTable((int32_t *) pos);
 
 	node->listSize = fetchInt(&t, 0);
 }
@@ -1224,7 +1232,7 @@ readArrowTypeFixedSizeList(ArrowTypeFixedSizeList *node, const char *pos)
 static void
 readArrowTypeMap(ArrowTypeMap *node, const char *pos)
 {
-	FBTable		t= fetchFBTable((int32 *) pos);
+	FBTable		t= fetchFBTable((int32_t *) pos);
 
 	node->keysSorted = fetchBool(&t, 0);
 }
@@ -1232,7 +1240,7 @@ readArrowTypeMap(ArrowTypeMap *node, const char *pos)
 static void
 readArrowTypeDuration(ArrowTypeDuration *node, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *) pos);
+	FBTable		t = fetchFBTable((int32_t *) pos);
 
 	node->unit = fetchShort(&t, 0);
 	if (node->unit != ArrowTimeUnit__Second &&
@@ -1344,7 +1352,7 @@ readArrowType(ArrowType *type, int type_tag, const char *type_pos)
 static void
 readArrowDictionaryEncoding(ArrowDictionaryEncoding *dict, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *)pos);
+	FBTable		t = fetchFBTable((int32_t *)pos);
 	const char *type_pos;
 
 	memset(dict, 0, sizeof(ArrowDictionaryEncoding));
@@ -1359,11 +1367,11 @@ readArrowDictionaryEncoding(ArrowDictionaryEncoding *dict, const char *pos)
 static void
 readArrowField(ArrowField *field, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *)pos);
+	FBTable		t = fetchFBTable((int32_t *)pos);
 	int			type_tag;
 	const char *type_pos;
 	const char *dict_pos;
-	int32	   *vector;
+	int32_t	   *vector;
 	int			i, nitems;
 
 	memset(field, 0, sizeof(ArrowField));
@@ -1423,9 +1431,9 @@ readArrowField(ArrowField *field, const char *pos)
 static void
 readArrowSchema(ArrowSchema *schema, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *)pos);
-	int32	   *vector;
-	int32		i, nitems;
+	FBTable		t = fetchFBTable((int32_t *)pos);
+	int32_t	   *vector;
+	int32_t		i, nitems;
 
 	memset(schema, 0, sizeof(ArrowSchema));
 	INIT_ARROW_NODE(schema, Schema);
@@ -1469,8 +1477,8 @@ static size_t
 readArrowFieldNode(ArrowFieldNode *node, const char *pos)
 {
 	struct {
-		int64		length		__attribute__ ((aligned(8)));
-		int64		null_count	__attribute__ ((aligned(8)));
+		int64_t		length		__attribute__ ((aligned(8)));
+		int64_t		null_count	__attribute__ ((aligned(8)));
 	} *fmap = (void *) pos;
 
 	memset(node, 0, sizeof(ArrowFieldNode));
@@ -1485,8 +1493,8 @@ static size_t
 readArrowBuffer(ArrowBuffer *node, const char *pos)
 {
 	struct {
-		int64		offset		__attribute__ ((aligned(8)));
-		int64		length		__attribute__ ((aligned(8)));
+		int64_t		offset		__attribute__ ((aligned(8)));
+		int64_t		length		__attribute__ ((aligned(8)));
 	} *fmap = (void *) pos;
 
 	memset(node, 0, sizeof(ArrowBuffer));
@@ -1502,7 +1510,7 @@ readArrowBuffer(ArrowBuffer *node, const char *pos)
 static void
 readArrowRecordBatch(ArrowRecordBatch *rbatch, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *)pos);
+	FBTable		t = fetchFBTable((int32_t *)pos);
 	const char *next;
 	int			i, nitems;
 
@@ -1533,7 +1541,7 @@ readArrowRecordBatch(ArrowRecordBatch *rbatch, const char *pos)
 static void
 readArrowDictionaryBatch(ArrowDictionaryBatch *dbatch, const char *pos)
 {
-	FBTable		t = fetchFBTable((int32 *)pos);
+	FBTable		t = fetchFBTable((int32_t *)pos);
 	const char *next;
 
 	memset(dbatch, 0, sizeof(ArrowDictionaryBatch));
@@ -1547,7 +1555,7 @@ readArrowDictionaryBatch(ArrowDictionaryBatch *dbatch, const char *pos)
 static void
 readArrowMessage(ArrowMessage *message, const char *pos)
 {
-	FBTable			t = fetchFBTable((int32 *)pos);
+	FBTable			t = fetchFBTable((int32_t *)pos);
 	int				mtype;
 	const char	   *next;
 
@@ -1591,9 +1599,9 @@ static size_t
 readArrowBlock(ArrowBlock *node, const char *pos)
 {
 	struct {
-		int64		offset			__attribute__ ((aligned(8)));
-		int32		metaDataLength	__attribute__ ((aligned(8)));
-		int64		bodyLength		__attribute__ ((aligned(8)));
+		int64_t		offset			__attribute__ ((aligned(8)));
+		int32_t		metaDataLength	__attribute__ ((aligned(8)));
+		int64_t		bodyLength		__attribute__ ((aligned(8)));
 	} *fmap = (void *) pos;
 
 	memset(node, 0, sizeof(ArrowBlock));
@@ -1611,7 +1619,7 @@ readArrowBlock(ArrowBlock *node, const char *pos)
 static void
 readArrowFooter(ArrowFooter *node, const char *pos)
 {
-	FBTable			t = fetchFBTable((int32 *)pos);
+	FBTable			t = fetchFBTable((int32_t *)pos);
 	const char	   *next;
 	int				i, nitems;
 
@@ -1662,19 +1670,22 @@ readArrowFooter(ArrowFooter *node, const char *pos)
 void
 readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 {
+	static long		__PAGE_SIZE = 0;
 	size_t			file_sz;
 	size_t			mmap_sz;
 	char		   *mmap_head = NULL;
 	char		   *mmap_tail = NULL;
 	const char	   *pos;
-	int32			offset;
-	int32			i, nitems;
+	int32_t			offset;
+	int32_t			i, nitems;
 
 	memset(af_info, 0, sizeof(ArrowFileInfo));
 	if (fstat(fdesc, &af_info->stat_buf) != 0)
 		Elog("failed on fstat: %m");
 	file_sz = af_info->stat_buf.st_size;
-	mmap_sz = TYPEALIGN(sysconf(_SC_PAGESIZE), file_sz);
+	if (__PAGE_SIZE == 0)
+		__PAGE_SIZE = sysconf(_SC_PAGESIZE);
+	mmap_sz = ((file_sz + __PAGE_SIZE - 1) & ~(__PAGE_SIZE - 1));
 	mmap_head = __mmap(NULL, mmap_sz, PROT_READ, MAP_SHARED, fdesc, 0);
 	if (mmap_head == MAP_FAILED)
 		Elog("failed on mmap: %m");
@@ -1692,10 +1703,10 @@ readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 	}
 
 	/* Read Footer chunk */
-	pos = mmap_tail - sizeof(int32);
-	offset = *((int32 *)pos);
+	pos = mmap_tail - sizeof(int32_t);
+	offset = *((int32_t *)pos);
 	pos -= offset;
-	offset = *((int32 *)pos);
+	offset = *((int32_t *)pos);
 	readArrowFooter(&af_info->footer, pos + offset);
 
 	/* Read DictionaryBatch chunks */
@@ -1707,9 +1718,9 @@ readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 		{
 			ArrowBlock	   *b = &af_info->footer.dictionaries[i];
 			ArrowMessage   *m = &af_info->dictionaries[i];
-			int32		   *ival = (int32 *)(mmap_head + b->offset);
-			int32			metaLength	__attribute__((unused));
-			int32		   *headOffset;
+			int32_t		   *ival = (int32_t *)(mmap_head + b->offset);
+			int32_t			metaLength	__attribute__((unused));
+			int32_t		   *headOffset;
 
 			if (*ival == 0xffffffff)
 			{
@@ -1736,9 +1747,9 @@ readArrowFileDesc(int fdesc, ArrowFileInfo *af_info)
 		{
 			ArrowBlock	   *b = &af_info->footer.recordBatches[i];
 			ArrowMessage   *m = &af_info->recordBatches[i];
-			int32		   *ival = (int32 *)(mmap_head + b->offset);
-			int32			metaLength	__attribute__((unused));
-			int32		   *headOffset;
+			int32_t		   *ival = (int32_t *)(mmap_head + b->offset);
+			int32_t			metaLength	__attribute__((unused));
+			int32_t		   *headOffset;
 
 			if (*ival == 0xffffffff)
 			{

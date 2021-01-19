@@ -1092,7 +1092,7 @@ sqldb_close_connection(void *sqldb_state)
  * misc functions
  */
 void *
-palloc(Size sz)
+palloc(size_t sz)
 {
 	void   *ptr = malloc(sz);
 
@@ -1102,7 +1102,7 @@ palloc(Size sz)
 }
 
 void *
-palloc0(Size sz)
+palloc0(size_t sz)
 {
 	void   *ptr = malloc(sz);
 
@@ -1123,7 +1123,7 @@ pstrdup(const char *str)
 }
 
 void *
-repalloc(void *old, Size sz)
+repalloc(void *old, size_t sz)
 {
 	char   *ptr = realloc(old, sz);
 

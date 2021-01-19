@@ -203,7 +203,7 @@ __form_kern_heaptuple(kern_context *kcxt,
 	cl_uint		i, curr;
 
 	/* alignment checks */
-	assert((uintptr_t)htup == MAXALIGN(htup));
+	assert((cl_ulong)htup == MAXALIGN(htup));
 
 	/* has any NULL attributes? */
 	if (tup_dclass != NULL)
@@ -622,7 +622,7 @@ pg_hash_any(const cl_uchar *k, cl_int keylen)
 	a = b = c = 0x9e3779b9 + len + 3923095;
 
 	/* If the source pointer is word-aligned, we use word-wide fetches */
-	if (((uintptr_t) k & (sizeof(cl_uint) - 1)) == 0)
+	if (((cl_ulong) k & (sizeof(cl_uint) - 1)) == 0)
 	{
 		/* Code path for aligned source data */
 		const cl_uint	*ka = (const cl_uint *) k;
