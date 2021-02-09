@@ -1074,22 +1074,18 @@ assignArrowTypeInt(SQLfield *column, bool is_signed,
 	{
 		case sizeof(char):
 			column->arrow_type.Int.bitWidth = 8;
-			column->arrow_typename = (is_signed ? "Int8" : "Uint8");
 			column->put_value = put_int8_value;
 			break;
 		case sizeof(short):
 			column->arrow_type.Int.bitWidth = 16;
-			column->arrow_typename = (is_signed ? "Int16" : "Uint16");
 			column->put_value = put_int16_value;
 			break;
 		case sizeof(int):
 			column->arrow_type.Int.bitWidth = 32;
-			column->arrow_typename = (is_signed ? "Int32" : "Uint32");
 			column->put_value = put_int32_value;
 			break;
 		case sizeof(long):
 			column->arrow_type.Int.bitWidth = 64;
-			column->arrow_typename = (is_signed ? "Int64" : "Uint64");
 			column->put_value = put_int64_value;
 			break;
 		default:
@@ -1119,19 +1115,16 @@ assignArrowTypeFloatingPoint(SQLfield *column, ArrowField *arrow_field)
 		case sizeof(short):		/* half */
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Half;
-			column->arrow_typename = "Float16";
 			column->put_value = put_float16_value;
 			break;
 		case sizeof(float):
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Single;
-			column->arrow_typename = "Float32";
 			column->put_value = put_float32_value;
 			break;
 		case sizeof(double):
 			column->arrow_type.FloatingPoint.precision
 				= ArrowPrecision__Double;
-			column->arrow_typename = "Float64";
 			column->put_value = put_float64_value;
 			break;
 		default:
@@ -1158,8 +1151,7 @@ assignArrowTypeBinary(SQLfield *column, ArrowField *arrow_field)
 		arrow_field->type.node.tag != ArrowNodeTag__Binary)
 		Elog("attribute '%s' is not compatible", column->field_name);
 	initArrowNode(&column->arrow_type, Binary);
-	column->arrow_typename	= "Binary";
-	column->put_value		= put_variable_value;
+	column->put_value = put_variable_value;
 	return 3;		/* nullmap + index + extra */
 }
 
@@ -1170,8 +1162,7 @@ assignArrowTypeUtf8(SQLfield *column, ArrowField *arrow_field)
 		arrow_field->type.node.tag != ArrowNodeTag__Utf8)
 		Elog("attribute '%s' is not compatible", column->field_name);
 	initArrowNode(&column->arrow_type, Utf8);
-	column->arrow_typename	= "Utf8";
-	column->put_value		= put_variable_value;
+	column->put_value = put_variable_value;
 	return 3;		/* nullmap + index + extra */
 }
 
@@ -1191,8 +1182,7 @@ assignArrowTypeBpchar(SQLfield *column, ArrowField *arrow_field)
 
 	initArrowNode(&column->arrow_type, FixedSizeBinary);
 	column->arrow_type.FixedSizeBinary.byteWidth = byteWidth;
-	column->arrow_typename	= "FixedSizeBinary";
-	column->put_value		= put_bpchar_value;
+	column->put_value = put_bpchar_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1205,8 +1195,7 @@ assignArrowTypeBool(SQLfield *column, ArrowField *arrow_field)
 		Elog("attribute %s is not compatible", column->field_name);
 
 	initArrowNode(&column->arrow_type, Bool);
-	column->arrow_typename	= "Bool";
-	column->put_value		= put_bool_value;
+	column->put_value = put_bool_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1235,8 +1224,7 @@ assignArrowTypeDecimal(SQLfield *column, ArrowField *arrow_field)
 	initArrowNode(&column->arrow_type, Decimal);
 	column->arrow_type.Decimal.precision = precision;
 	column->arrow_type.Decimal.scale = scale;
-	column->arrow_typename	= "Decimal";
-	column->put_value		= put_decimal_value;
+	column->put_value = put_decimal_value;
 #else
 #error "Int128 must be enabled for Arrow::Decimal support"
 #endif
@@ -1256,8 +1244,7 @@ assignArrowTypeDate(SQLfield *column, ArrowField *arrow_field)
 	}
 	initArrowNode(&column->arrow_type, Date);
 	column->arrow_type.Date.unit = unit;
-	column->arrow_typename	= "Date";
-	column->put_value		= put_date_value;
+	column->put_value = put_date_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1276,8 +1263,7 @@ assignArrowTypeTime(SQLfield *column, ArrowField *arrow_field)
 	initArrowNode(&column->arrow_type, Time);
 	column->arrow_type.Time.unit = unit;
 	column->arrow_type.Time.bitWidth = 64;
-	column->arrow_typename	= "Time";
-	column->put_value		= put_time_value;
+	column->put_value = put_time_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1301,8 +1287,7 @@ assignArrowTypeTimestamp(SQLfield *column, const char *tz_name,
 		column->arrow_type.Timestamp.timezone = pstrdup(tz_name);
 		column->arrow_type.Timestamp._timezone_len = strlen(tz_name);
 	}
-	column->arrow_typename	= "Timestamp";
-	column->put_value		= put_timestamp_value;
+	column->put_value = put_timestamp_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1320,8 +1305,7 @@ assignArrowTypeInterval(SQLfield *column, ArrowField *arrow_field)
 	}
 	initArrowNode(&column->arrow_type, Interval);
 	column->arrow_type.Interval.unit = unit;
-	column->arrow_typename	= "Interval";
-	column->put_value       = put_interval_value;
+	column->put_value = put_interval_value;
 
 	return 2;		/* nullmap + values */
 }
@@ -1334,8 +1318,7 @@ assignArrowTypeList(SQLfield *column, ArrowField *arrow_field)
 		Elog("attribute %s is not compatible", column->field_name);
 
 	initArrowNode(&column->arrow_type, List);
-	column->arrow_typename	= "List";
-	column->put_value		= put_array_value;
+	column->put_value = put_array_value;
 
 	return 2;		/* nullmap + offset vector */
 }
@@ -1348,8 +1331,7 @@ assignArrowTypeStruct(SQLfield *column, ArrowField *arrow_field)
 		Elog("attribute %s is not compatible", column->field_name);
 
 	initArrowNode(&column->arrow_type, Struct);
-	column->arrow_typename	= "Struct";
-	column->put_value		= put_composite_value;
+	column->put_value = put_composite_value;
 
 	return 1;	/* only nullmap */
 }
@@ -1373,9 +1355,7 @@ assignArrowTypeDictionary(SQLfield *column, ArrowField *arrow_field)
 	}
 
 	initArrowNode(&column->arrow_type, Utf8);
-	column->arrow_typename	= psprintf("Enum; dictionary=%u",
-									   column->sql_type.pgsql.typeid);
-	column->put_value		= put_dictionary_value;
+	column->put_value = put_dictionary_value;
 
 	return 2;	/* nullmap + values */
 }

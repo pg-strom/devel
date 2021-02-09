@@ -65,6 +65,16 @@ CREATE FUNCTION pgstrom.gpustore_synchronizer(bigint,int=-1)
   LANGUAGE C;
 
 ---
+--- arrow_fdw special import function
+---
+CREATE FUNCTION pgstrom.arrow_fdw_import_file(text,         -- relname
+                                              text,	        -- filename
+                                              text = null)  -- schema
+  RETURNS void
+  AS 'MODULE_PATHNAME','pgstrom_arrow_fdw_import_file'
+  LANGUAGE C;
+
+---
 --- Deprecated functions
 ---
 DROP FUNCTION IF EXISTS public.gpu_device_name(int);

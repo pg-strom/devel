@@ -74,6 +74,7 @@
 #include "commands/event_trigger.h"
 #include "commands/explain.h"
 #include "commands/proclang.h"
+#include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"

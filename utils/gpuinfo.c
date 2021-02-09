@@ -428,7 +428,7 @@ int main(int argc, char *argv[])
 	if (heterodbExtraInit() == 0)
 	{
 		linfo = heterodbLicenseReload(NULL);
-		if (linfo->version != 2)
+		if (linfo && linfo->version != 2)
 		{
 			fprintf(stderr, "unknown license format version: %u", linfo->version);
 			linfo = NULL;

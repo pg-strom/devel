@@ -809,17 +809,18 @@ createArrowFooter(ArrowFooter *node)
 /* ----------------------------------------------------------------
  * Routines for File I/O
  * ---------------------------------------------------------------- */
-#if 1
 void
 arrowFileWrite(SQLtable *table, const char *buffer, ssize_t length)
 {
 	ssize_t		offset = 0;
 	ssize_t		nbytes;
 
-	assert(lseek(table->fdesc, SEEK_CUR, 0) == table->f_pos);
 	while (offset < length)
 	{
-		nbytes = write(table->fdesc, buffer + offset, length - offset);
+		nbytes = pwrite(table->fdesc,
+						buffer + offset,
+						length - offset,
+						table->f_pos + offset);
 		if (nbytes <= 0)
 		{
 			if (errno == EINTR)
@@ -830,7 +831,66 @@ arrowFileWrite(SQLtable *table, const char *buffer, ssize_t length)
 	}
 	table->f_pos += length;
 }
-#endif
+
+void
+arrowFileWriteIOV(SQLtable *table)
+{
+	int			index = 0;
+	ssize_t		nbytes;
+
+	while (index < table->__iov_cnt)
+	{
+		nbytes = pwritev(table->fdesc,
+						 table->__iov,
+						 table->__iov_cnt - index,
+						 table->f_pos);
+		if (nbytes < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			Elog("failed on pwritev('%s'): %m", table->filename);
+		}
+		else if (nbytes == 0)
+		{
+			Elog("unable to write on '%s' any more", table->filename);
+		}
+
+		table->f_pos += nbytes;
+		while (index < table->__iov_cnt &&
+			   nbytes >= table->__iov[index].iov_len)
+		{
+			nbytes -= table->__iov[index++].iov_len;
+		}
+		assert(index < table->__iov_cnt || nbytes == 0);
+		if (nbytes > 0)
+		{
+			table->__iov[index].iov_len -= nbytes;
+			table->__iov[index].iov_base =
+				((char *)table->__iov[index].iov_base + nbytes);
+		}
+	}
+	table->__iov_cnt = 0;
+}
+
+static void
+arrowFileAppendIOV(SQLtable *table, void *addr, size_t sz)
+{
+	struct iovec *iov;
+
+    /* expand on demand */
+	if (table->__iov_cnt >= table->__iov_len)
+	{
+		table->__iov_len += 40;
+		if (!table->__iov)
+			table->__iov = palloc(sizeof(struct iovec) * table->__iov_len);
+		else
+			table->__iov = repalloc(table->__iov,
+									sizeof(struct iovec) * table->__iov_len);
+	}
+	iov = &table->__iov[table->__iov_cnt++];
+	iov->iov_base = addr;
+	iov->iov_len  = sz;
+}
 
 /*
  * sql_buffer_write - A wrapper of arrowFileWrite for SQLbuffer
@@ -838,20 +898,29 @@ arrowFileWrite(SQLtable *table, const char *buffer, ssize_t length)
 static inline void
 sql_buffer_write(SQLtable *table, SQLbuffer *buf)
 {
-	ssize_t		length = buf->usage;
-	ssize_t		gap = ARROWALIGN(length) - length;
-	char		zero[64];
+	ssize_t		length = ARROWALIGN(buf->usage);
+	ssize_t		gap = length - buf->usage;
 
+	if (gap > 0)
+		memset(buf->data + buf->usage, 0, gap);
 	arrowFileWrite(table, buf->data, length);
-	if (gap)
-	{
-		memset(zero, 0, gap);
-		arrowFileWrite(table, zero, gap);
-	}
+}
+
+static inline size_t
+sql_buffer_append_iov(SQLtable *table, SQLbuffer *buf)
+{
+	size_t	length = ARROWALIGN(buf->usage);
+	size_t	gap = length - buf->usage;
+
+	if (gap > 0)
+		memset(buf->data + buf->usage, 0, gap);
+	arrowFileAppendIOV(table, buf->data, length);
+
+	return length;
 }
 
 /*
- * writeFlatBufferMessage
+ * setupFlatBufferMessageIOV
  */
 typedef struct
 {
@@ -861,8 +930,8 @@ typedef struct
 	char		data[FLEXIBLE_ARRAY_MEMBER];
 } FBMessageFileImage;
 
-static ssize_t
-writeFlatBufferMessage(SQLtable *table, ArrowMessage *message)
+static size_t
+setupFlatBufferMessageIOV(SQLtable *table, ArrowMessage *message)
 {
 	FBTableBuf *payload = createArrowMessage(message);
 	FBMessageFileImage *image;
@@ -875,14 +944,13 @@ writeFlatBufferMessage(SQLtable *table, ArrowMessage *message)
 	gap = offset - payload->vtable.vlen;
 	length = LONGALIGN(offsetof(FBMessageFileImage,
 								data[gap + payload->length]));
-	image = alloca(length);
-	memset(image, 0, length);
+	image = palloc0(length);
 	image->continuation = 0xffffffff;
 	image->metaLength = length - offsetof(FBMessageFileImage, rootOffset);
 	image->rootOffset = sizeof(int32_t) + offset;
 	memcpy(image->data + gap, &payload->vtable, payload->length);
 
-	arrowFileWrite(table, (const char *)image, length);
+	arrowFileAppendIOV(table, image, length);
 
 	return length;
 }
@@ -919,19 +987,15 @@ writeFlatBufferFooter(SQLtable *table, ArrowFooter *footer)
 	nbytes = INTALIGN(offset + payload->length);
 	length = (offsetof(FBFooterFileImage, data[nbytes]) +
 			  offsetof(FBFooterTailImage, signature[6]));
-	buffer = alloca(sizeof(uint64_t) + length + 1);
+	buffer = palloc0(sizeof(uint64_t) + length + 1);
 
 	/* put EOS mark */
 	memcpy(buffer, &eos, sizeof(uint64_t));
 	/* put headers */
 	image = (FBFooterFileImage *)(buffer + sizeof(uint64_t));
 	image->rootOffset = sizeof(int32_t) + INTALIGN(payload->vtable.vlen);
-	if (offset > 0)
-		memset(image->data, 0, offset);
     memcpy(image->data + offset, &payload->vtable, payload->length);
     offset += payload->length;
-	if (offset < nbytes)
-		memset(image->data + offset, 0, nbytes - offset);
 	tail = (FBFooterTailImage *)(image->data + nbytes);
 	tail->metaOffset = nbytes + sizeof(int32_t);
 	strcpy(tail->signature, "ARROW1");
@@ -990,8 +1054,8 @@ setupArrowField(ArrowField *field, SQLfield *column)
 	field->custom_metadata = column->customMetadata;
 }
 
-ssize_t
-writeArrowSchema(SQLtable *table)
+static size_t
+setupArrowSchemaIOV(SQLtable *table)
 {
 	ArrowMessage	message;
 	ArrowSchema	   *schema;
@@ -1009,15 +1073,22 @@ writeArrowSchema(SQLtable *table)
 		setupArrowField(&schema->fields[i], &table->columns[i]);
 	schema->custom_metadata = table->customMetadata;
 	schema->_num_custom_metadata = table->numCustomMetadata;
-	/* serialization */
-	return writeFlatBufferMessage(table, &message);
+
+	return setupFlatBufferMessageIOV(table, &message);
 }
 
+void
+writeArrowSchema(SQLtable *table)
+{
+	table->__iov_cnt = 0;	/* ensure empty */
+	setupArrowSchemaIOV(table);
+	arrowFileWriteIOV(table);
+}
 
 /*
  * writeArrowDictionaryBatches
  */
-static ArrowBlock
+static void
 __writeArrowDictionaryBatch(SQLtable *table, SQLdictionary *dict)
 {
 	ArrowMessage	message;
@@ -1025,10 +1096,11 @@ __writeArrowDictionaryBatch(SQLtable *table, SQLdictionary *dict)
 	ArrowRecordBatch *rbatch;
 	ArrowFieldNode	fnodes[1];
 	ArrowBuffer		buffers[3];
-	ArrowBlock		block;
-	loff_t			curr_pos;
+	ArrowBlock	   *block;
 	size_t			metaLength = 0;
 	size_t			bodyLength = 0;
+
+	table->__iov_cnt = 0;
 
 	initArrowNode(&message, Message);
 
@@ -1043,7 +1115,7 @@ __writeArrowDictionaryBatch(SQLtable *table, SQLdictionary *dict)
 	fnodes[0].length = dict->nitems - dict->nloaded;
 	fnodes[0].null_count = 0;
 
-	/* ArrowBuffer[0] of RecordBatch -- nullmap */
+	/* ArrowBuffer[0] of RecordBatch -- nullmap (but NOT-NULL) */
 	initArrowNode(&buffers[0], Buffer);
 	buffers[0].offset = bodyLength;
 	buffers[0].length = 0;
@@ -1073,42 +1145,37 @@ __writeArrowDictionaryBatch(SQLtable *table, SQLdictionary *dict)
     message.version = ArrowMetadataVersion__V4;
 	message.bodyLength = bodyLength;
 
-	assert(lseek(table->fdesc, 0, SEEK_CUR) == table->f_pos);
-	curr_pos = table->f_pos;
-	metaLength = writeFlatBufferMessage(table, &message);
-	sql_buffer_write(table, &dict->values);
-	sql_buffer_write(table, &dict->extra);
+	metaLength = setupFlatBufferMessageIOV(table, &message);
+	sql_buffer_append_iov(table, &dict->values);
+	sql_buffer_append_iov(table, &dict->extra);
 
-	/* setup Block of Footer */
-	initArrowNode(&block, Block);
-	block.offset = curr_pos;
-	block.metaDataLength = metaLength;
-	block.bodyLength = bodyLength;
+	/* setup Block of the DictionaryBatch message */
+	if (!table->dictionaries)
+		table->dictionaries = palloc0(sizeof(ArrowBlock) * 40);
+	else
+		table->dictionaries = palloc0(sizeof(ArrowBlock) *
+									  (table->numDictionaries + 1));
+	block = &table->dictionaries[table->numDictionaries++];
 
-	return block;
+	initArrowNode(block, Block);
+	block->offset = table->f_pos;
+	block->metaDataLength = metaLength;
+	block->bodyLength = bodyLength;
+
+	arrowFileWriteIOV(table);
 }
 
 void
 writeArrowDictionaryBatches(SQLtable *table)
 {
 	SQLdictionary  *dict;
-	ArrowBlock		block;
-	int				index = table->numDictionaries;
 
 	for (dict = table->sql_dict_list; dict; dict = dict->next)
 	{
 		if (dict->nloaded > 0 && dict->nloaded == dict->nitems)
 			continue;		/* nothing to be written */
-
-		if (!table->dictionaries)
-			table->dictionaries = palloc0(sizeof(ArrowBlock) * (index+1));
-		else
-			table->dictionaries = repalloc(table->dictionaries,
-										   sizeof(ArrowBlock) * (index+1));
-		block = __writeArrowDictionaryBatch(table, dict);
-		table->dictionaries[index++] = block;
+		__writeArrowDictionaryBatch(table, dict);
 	}
-	table->numDictionaries = index;
 }
 
 /*
@@ -1251,7 +1318,7 @@ setupArrowBuffer(ArrowBuffer *bnode, SQLfield *column, size_t *p_offset)
 
 			default:
 				Elog("Bug? Arrow Type %s is not supported right now",
-					 column->arrow_typename);
+					 arrowNodeName(&column->arrow_type.node));
 				break;
 		}
 	}
@@ -1259,23 +1326,18 @@ setupArrowBuffer(ArrowBuffer *bnode, SQLfield *column, size_t *p_offset)
 	return retval;
 }
 
-size_t
-estimateArrowBufferLength(SQLfield *column, size_t nitems)
+static size_t
+setupArrowBufferIOV(SQLtable *table, SQLfield *column)
 {
-	size_t		len = 0;
-	int			j;
+	size_t		consumed = 0;
 
-	if (column->nitems != nitems)
-		Elog("Bug? number of items mismatch");
-	
 	if (column->enumdict)
 	{
 		/* Enum data types */
 		assert(column->arrow_type.node.tag == ArrowNodeTag__Utf8);
 		if (column->nullcount > 0)
-			len += ARROWALIGN(column->nullmap.usage);
-		len += ARROWALIGN(column->values.usage);
-		assert(column->extra.usage == 0);
+			consumed += sql_buffer_append_iov(table, &column->nullmap);
+		consumed += sql_buffer_append_iov(table, &column->values);
 	}
 	else if (column->element)
 	{
@@ -1283,82 +1345,9 @@ estimateArrowBufferLength(SQLfield *column, size_t nitems)
 		assert(column->arrow_type.node.tag == ArrowNodeTag__List ||
 			   column->arrow_type.node.tag == ArrowNodeTag__LargeList);
 		if (column->nullcount > 0)
-			len += ARROWALIGN(column->nullmap.usage);
-		len += ARROWALIGN(column->values.usage);
-		assert(column->extra.usage == 0);
-		len += estimateArrowBufferLength(column->element, nitems);
-	}
-	else if (column->subfields)
-	{
-		/* Composite data types */
-		assert(column->arrow_type.node.tag == ArrowNodeTag__Struct);
-		if (column->nullcount > 0)
-			len += ARROWALIGN(column->nullmap.usage);
-		assert(column->values.usage == 0 ||
-			   column->extra.usage == 0);
-		for (j=0; j < column->nfields; j++)
-			len += estimateArrowBufferLength(&column->subfields[j], nitems);
-	}
-	else
-	{
-		switch (column->arrow_type.node.tag)
-		{
-			/* inline type */
-			case ArrowNodeTag__Int:
-			case ArrowNodeTag__FloatingPoint:
-			case ArrowNodeTag__Bool:
-			case ArrowNodeTag__Decimal:
-			case ArrowNodeTag__Date:
-			case ArrowNodeTag__Time:
-			case ArrowNodeTag__Timestamp:
-			case ArrowNodeTag__Interval:
-			case ArrowNodeTag__FixedSizeBinary:
-				if (column->nullcount > 0)
-					len += ARROWALIGN(column->nullmap.usage);
-				len += ARROWALIGN(column->values.usage);
-				assert(column->extra.usage == 0);
-				break;
-
-			/* variable length type */
-			case ArrowNodeTag__Utf8:
-			case ArrowNodeTag__Binary:
-			case ArrowNodeTag__LargeUtf8:
-			case ArrowNodeTag__LargeBinary:
-				if (column->nullcount > 0)
-					len += ARROWALIGN(column->nullmap.usage);
-				len += ARROWALIGN(column->values.usage);
-				len += ARROWALIGN(column->extra.usage);
-				break;
-
-			default:
-				Elog("Bug? Arrow Type %s is not supported right now",
-					 column->arrow_typename);
-				break;
-		}
-	}
-	return len;
-}
-
-static void
-writeArrowBuffer(SQLtable *table, SQLfield *column)
-{
-	if (column->enumdict)
-	{
-		/* Enum data types */
-		assert(column->arrow_type.node.tag == ArrowNodeTag__Utf8);
-		if (column->nullcount > 0)
-			sql_buffer_write(table, &column->nullmap);
-		sql_buffer_write(table, &column->values);
-	}
-	else if (column->element)
-	{
-		/* Array data types */
-		assert(column->arrow_type.node.tag == ArrowNodeTag__List ||
-			   column->arrow_type.node.tag == ArrowNodeTag__LargeList);
-		if (column->nullcount > 0)
-			sql_buffer_write(table, &column->nullmap);
-		sql_buffer_write(table, &column->values);
-		writeArrowBuffer(table, column->element);
+			consumed += sql_buffer_append_iov(table, &column->nullmap);
+		consumed += sql_buffer_append_iov(table, &column->values);
+		consumed += setupArrowBufferIOV(table, column->element);
 	}
 	else if (column->subfields)
 	{
@@ -1367,9 +1356,9 @@ writeArrowBuffer(SQLtable *table, SQLfield *column)
 		/* Composite data types */
 		assert(column->arrow_type.node.tag == ArrowNodeTag__Struct);
 		if (column->nullcount > 0)
-			sql_buffer_write(table, &column->nullmap);
+			consumed += sql_buffer_append_iov(table, &column->nullmap);
 		for (j=0; j < column->nfields; j++)
-			writeArrowBuffer(table, &column->subfields[j]);
+			consumed += setupArrowBufferIOV(table, &column->subfields[j]);
 	}
 	else
 	{
@@ -1386,8 +1375,8 @@ writeArrowBuffer(SQLtable *table, SQLfield *column)
 			case ArrowNodeTag__Interval:
 			case ArrowNodeTag__FixedSizeBinary:
 				if (column->nullcount > 0)
-					sql_buffer_write(table, &column->nullmap);
-				sql_buffer_write(table, &column->values);
+					consumed += sql_buffer_append_iov(table, &column->nullmap);
+				consumed += sql_buffer_append_iov(table, &column->values);
 				break;
 
 			/* variable length type */
@@ -1396,68 +1385,33 @@ writeArrowBuffer(SQLtable *table, SQLfield *column)
 			case ArrowNodeTag__LargeUtf8:
 			case ArrowNodeTag__LargeBinary:
 				if (column->nullcount > 0)
-					sql_buffer_write(table, &column->nullmap);
-				sql_buffer_write(table, &column->values);
-				sql_buffer_write(table, &column->extra);
+					consumed += sql_buffer_append_iov(table, &column->nullmap);
+				consumed += sql_buffer_append_iov(table, &column->values);
+				consumed += sql_buffer_append_iov(table, &column->extra);
 				break;
 
 			default:
 				Elog("Bug? Arrow Type %s is not supported right now",
-					 column->arrow_typename);
+					 arrowNodeName(&column->arrow_type.node));
 				break;
 		}
 	}
+	return consumed;
 }
 
-static void
-sql_field_clear(SQLfield *column)
-{
-	int		j;
-	
-	column->nitems = 0;
-	column->nullcount = 0;
-	sql_buffer_clear(&column->nullmap);
-	sql_buffer_clear(&column->values);
-	sql_buffer_clear(&column->extra);
-	column->__curr_usage__ = 0;
-
-	if (column->element)
-		sql_field_clear(column->element);
-	if (column->nfields > 0)
-	{
-		for (j=0; j < column->nfields; j++)
-			sql_field_clear(&column->subfields[j]);
-	}
-}
-
-int
-writeArrowRecordBatch(SQLtable *table)
+size_t
+setupArrowRecordBatchIOV(SQLtable *table)
 {
 	ArrowMessage	message;
 	ArrowRecordBatch *rbatch;
 	ArrowFieldNode *nodes;
 	ArrowBuffer	   *buffers;
-	ArrowBlock	   *block;
 	int				i, j;
-	int				index;
-	off_t			curr_pos;
-	volatile off_t hoge;
-	size_t			metaLength;
 	size_t			bodyLength = 0;
+	size_t			consumed;
 
 	assert(table->nitems > 0);
-	/* align current file position, if needed */
-	if (table->f_pos != LONGALIGN(table->f_pos))
-	{
-		uint64_t	zero = 0;
-		size_t		gap = LONGALIGN(table->f_pos) - table->f_pos;
-
-		arrowFileWrite(table, (const char *)&zero, gap);
-	}
-	hoge = lseek(table->fdesc, 0, SEEK_CUR);
-	assert(hoge == table->f_pos);
-//	assert(lseek(table->fdesc, 0, SEEK_CUR) == table->f_pos);
-	curr_pos = table->f_pos;
+	assert(table->f_pos == LONGALIGN(table->f_pos));
 	
 	/* fill up [nodes] vector */
 	nodes = alloca(sizeof(ArrowFieldNode) * table->numFieldNodes);
@@ -1490,29 +1444,33 @@ writeArrowRecordBatch(SQLtable *table)
 	rbatch->buffers = buffers;
 	rbatch->_num_buffers = table->numBuffers;
 	/* serialization */
-	metaLength = writeFlatBufferMessage(table, &message);
+	consumed = setupFlatBufferMessageIOV(table, &message);
 	for (j=0; j < table->nfields; j++)
-		writeArrowBuffer(table, &table->columns[j]);
+		consumed += setupArrowBufferIOV(table, &table->columns[j]);
+	return consumed;
+}
 
-	/* save the offset/length at ArrowBlock */
-	index = table->numRecordBatches++;
-	if (index == 0)
-		table->recordBatches = palloc(sizeof(ArrowBlock) * 32);
-	else
-		table->recordBatches = repalloc(table->recordBatches,
-										sizeof(ArrowBlock) * (index+1));
-	block = &table->recordBatches[index];
-	initArrowNode(block, Block);
-	block->offset = curr_pos;
-	block->metaDataLength = metaLength;
-	block->bodyLength = bodyLength;
+int
+writeArrowRecordBatch(SQLtable *table)
+{
+	ArrowBlock	block;
+	size_t		length;
+	size_t		meta_sz;
 
-	/* make the local buffer empty again */
-	for (j=0; j < table->nfields; j++)
-		sql_field_clear(&table->columns[j]);
-	table->nitems = 0;
+	table->__iov_cnt = 0;				/* reset iov */
+	length = setupArrowRecordBatchIOV(table);
+	assert(table->__iov_cnt > 0 &&
+		   table->__iov[0].iov_len <= length);
+	meta_sz = table->__iov[0].iov_len;	/* metadata chunk */
 
-	return index;
+	initArrowNode(&block, Block);
+	block.offset = table->f_pos;
+	block.metaDataLength = meta_sz;
+	block.bodyLength = length - meta_sz;
+
+	arrowFileWriteIOV(table);
+
+	return sql_table_append_record_batch(table, &block);
 }
 
 /*

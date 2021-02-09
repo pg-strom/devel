@@ -430,7 +430,8 @@ __dumpArrowFooter(SQLbuffer *buf, ArrowNode *node)
 		f->version == ArrowMetadataVersion__V1 ? "V1" :
 		f->version == ArrowMetadataVersion__V2 ? "V2" :
 		f->version == ArrowMetadataVersion__V3 ? "V3" :
-		f->version == ArrowMetadataVersion__V4 ? "V4" : "???");
+		f->version == ArrowMetadataVersion__V4 ? "V4" :
+		f->version == ArrowMetadataVersion__V5 ? "V5" : "???");
 	__dumpArrowNode(buf, (ArrowNode *)&f->schema);
 	sql_buffer_printf(buf, ", dictionaries=[");
 	for (i=0; i < f->_num_dictionaries; i++)
@@ -764,125 +765,158 @@ copyArrowNode(ArrowNode *dest, const ArrowNode *src)
 	src->copyArrowNode(dest, src);
 }
 
-/*
- * CString representation of arrow type name
- */
-static size_t
-__arrowTypeName(char *buf, size_t len, ArrowField *field)
+const char *
+arrowNodeName(ArrowNode *node)
 {
-	ArrowType  *t = &field->type;
-	size_t		sz = 0;
-	int			j;
+	static __thread char buf[128];
+	ArrowPrecision	prep;
+	ArrowDateUnit	d_unit;
+	ArrowTimeUnit	t_unit;
+	ArrowIntervalUnit i_unit;
+	const char	   *timezone;
+	int		off;
 
-	switch (t->node.tag)
+	switch (node->tag)
 	{
 		case ArrowNodeTag__Null:
-			sz = snprintf(buf, len, "Null");
-			break;
+			return "Arrow::Null";
+
 		case ArrowNodeTag__Int:
-			sz = snprintf(buf, len, "%s%d",
-						  t->Int.is_signed ? "Int" : "Uint",
-						  t->Int.bitWidth);
-			break;
+			snprintf(buf, sizeof(buf), "Arrow::%s%d",
+					 ((ArrowTypeInt *)node)->is_signed ? "Int" : "Uint",
+					 ((ArrowTypeInt *)node)->bitWidth * 8);
+			return buf;
+
 		case ArrowNodeTag__FloatingPoint:
-			sz = snprintf(
-				buf, len, "Float%s",
-				ArrowPrecisionAsCstring(t->FloatingPoint.precision));
-			break;
+			prep = ((ArrowTypeFloatingPoint*)node)->precision;
+			snprintf(buf, sizeof(buf), "Arrow::Float%s",
+					 ArrowPrecisionAsCstring(prep));
+			return buf;
+
 		case ArrowNodeTag__Utf8:
-			sz = snprintf(buf, len, "Utf8");
-			break;
+			return "Arrow::Utf8";
+
 		case ArrowNodeTag__Binary:
-			sz = snprintf(buf, len, "Binary");
-			break;
+			return "Arrow::Binary";
+
 		case ArrowNodeTag__Bool:
-			sz = snprintf(buf, len, "Bool");
-			break;
+			return "Arrow::Bool";
+
 		case ArrowNodeTag__Decimal:
-			if (t->Decimal.scale == 0)
-				sz = snprintf(buf, len, "Decimal(%d)",
-							  t->Decimal.precision);
+			if (((ArrowTypeDecimal *)node)->scale == 0)
+				snprintf(buf, sizeof(buf), "Arrow::Decimal(%d)",
+						 ((ArrowTypeDecimal *)node)->precision);
 			else
-				sz = snprintf(buf, len, "Decimal(%d,%d)",
-							  t->Decimal.precision,
-							  t->Decimal.scale);
-			break;
+				snprintf(buf, sizeof(buf), "Arrow::Decimal(%d,%d)",
+						 ((ArrowTypeDecimal *)node)->precision,
+						 ((ArrowTypeDecimal *)node)->scale);
+			return buf;
+
 		case ArrowNodeTag__Date:
-			sz = snprintf(
-				buf, len, "Date[%s]",
-				ArrowDateUnitAsCstring(t->Date.unit));
-			break;
+			d_unit = ((ArrowTypeDate *)node)->unit;
+			snprintf(buf, sizeof(buf), "Arrow::Date[%s]",
+					 ArrowDateUnitAsCstring(d_unit));
+			return buf;
+
 		case ArrowNodeTag__Time:
-			sz = snprintf(buf, len, "Time[%s]",
-						  ArrowTimeUnitAsCstring(t->Time.unit));
-			break;
+			t_unit = ((ArrowTypeTime *)node)->unit;
+			snprintf(buf, sizeof(buf), "Arrow::Time%d%s",
+					 ((ArrowTypeTime *)node)->bitWidth,
+					 ArrowTimeUnitAsCstring(t_unit));
+			return buf;
+
 		case ArrowNodeTag__Timestamp:
-			sz = snprintf(buf, len, "Timestamp[%s]",
-						  ArrowTimeUnitAsCstring(t->Timestamp.unit));
-			break;
+			t_unit = ((ArrowTypeTimestamp *)node)->unit;
+			timezone = ((ArrowTypeTimestamp *)node)->timezone;
+			off = snprintf(buf, sizeof(buf), "Arrow::Timestamp%s",
+						   ArrowTimeUnitAsCstring(t_unit));
+			if (timezone)
+				snprintf(buf+off, sizeof(buf)-off, " <%s>", timezone);
+			return buf;
+			
 		case ArrowNodeTag__Interval:
-			sz = snprintf(buf, len, "Interval[%s]",
-						  ArrowIntervalUnitAsCstring(t->Interval.unit));
-			break;
+			i_unit = ((ArrowTypeInterval *)node)->unit;
+			snprintf(buf, sizeof(buf), "Arrow::Interval[%s]",
+					 ArrowIntervalUnitAsCstring(i_unit));
+			return buf;
+
 		case ArrowNodeTag__List:
-			if (field->_num_children != 1)
-				Elog("corrupted List data type");
-			sz = __arrowTypeName(buf, len, &field->children[0]);
-			sz += snprintf(buf+sz, len-sz, "[]");
-			break;
+			return "Arrow::List";
 
 		case ArrowNodeTag__Struct:
-			sz += snprintf(buf+sz, len-sz, "Struct(");
-			for (j=0; j < field->_num_children; j++)
-			{
-				if (j > 0)
-					sz += snprintf(buf+sz, len-sz, ", ");
-				sz += __arrowTypeName(buf+sz, len-sz, &field->children[j]);
-			}
-			sz += snprintf(buf+sz, len-sz, ")");
-			break;
+			return "Arrow::Struct";
 
 		case ArrowNodeTag__Union:
-			sz = snprintf(buf, len, "Union");
-			break;
+			return "Arrow::Union";
+
 		case ArrowNodeTag__FixedSizeBinary:
-			sz = snprintf(buf, len, "FixedSizeBinary(%d)",
-						  t->FixedSizeBinary.byteWidth);
-			break;
+			snprintf(buf, sizeof(buf), "Arrow::FixedSizeBinary<%d>",
+					 ((ArrowTypeFixedSizeBinary *)node)->byteWidth);
+			return buf;
+
 		case ArrowNodeTag__FixedSizeList:
-			sz = snprintf(buf, len, "FixedSizeList[%d]",
-						  t->FixedSizeList.listSize);
-			break;
+			snprintf(buf, sizeof(buf), "Arrow::FixedSizeList<%d>",
+					 ((ArrowTypeFixedSizeList *)node)->listSize);
+			return buf;
+
 		case ArrowNodeTag__Map:
-			sz = snprintf(buf, len, "Map");
-			break;
+			return "Arrow::Map";
+
 		case ArrowNodeTag__Duration:
-			sz = snprintf(buf, len, "Duration[%s]",
-						  ArrowTimeUnitAsCstring(t->Duration.unit));
-			break;
+			t_unit = ((ArrowTypeDuration *)node)->unit;
+			snprintf(buf, sizeof(buf), "Arrow::Duration%s",
+					 t_unit == ArrowTimeUnit__Second ? "" :
+					 t_unit == ArrowTimeUnit__MilliSecond ? "[ms]" :
+					 t_unit == ArrowTimeUnit__MicroSecond ? "[us]" :
+					 t_unit == ArrowTimeUnit__NanoSecond ? "[ns]" : "[??]");
+			return buf;
+
 		case ArrowNodeTag__LargeBinary:
-			sz = snprintf(buf, len, "LargeBinary");
-			break;
+			return "Arrow::LargeBinary";
+
 		case ArrowNodeTag__LargeUtf8:
-			sz = snprintf(buf, len, "LargeUtf8");
-			break;
+			return "Arrow::LargeUtf8";
+
 		case ArrowNodeTag__LargeList:
-			sz = snprintf(buf, len, "LargeList");
-			break;
+			return "Arrow::LargeList";
+
+		case ArrowNodeTag__KeyValue:
+			return "Arrow::KeyValue";
+
+		case ArrowNodeTag__DictionaryEncoding:
+			return "Arrow::DictionaryEncoding";
+
+		case ArrowNodeTag__Field:
+			return "Arrow::Field";
+
+		case ArrowNodeTag__FieldNode:
+			return "Arrow::FieldNode";
+
+		case ArrowNodeTag__Buffer:
+			return "Arrow::Buffer";
+
+		case ArrowNodeTag__Schema:
+			return "Arrow::Schema";
+
+		case ArrowNodeTag__RecordBatch:
+			return "Arrow::RecordBatch";
+
+		case ArrowNodeTag__DictionaryBatch:
+			return "Arrow::DictionaryBatch";
+
+		case ArrowNodeTag__Message:
+			return "Arrow::Message";
+
+		case ArrowNodeTag__Block:
+			return "Arrow::Block";
+
+		case ArrowNodeTag__Footer:
+			return "Arrow::Footer";
+
 		default:
-			Elog("unknown Arrow type");
+			break;
 	}
-	return sz;
-}
-
-char *
-arrowTypeName(ArrowField *field)
-{
-	char	buf[1024];
-
-	__arrowTypeName(buf, sizeof(buf), field);
-
-	return pstrdup(buf);
+	return "Unknown";
 }
 
 /* ------------------------------------------------
@@ -1566,7 +1600,8 @@ readArrowMessage(ArrowMessage *message, const char *pos)
 	next				= fetchOffset(&t, 2);
 	message->bodyLength	= fetchLong(&t, 3);
 
-	if (message->version != ArrowMetadataVersion__V4)
+	if (message->version < ArrowMetadataVersion__V4 ||
+		message->version > ArrowMetadataVersion__V5)
 		Elog("metadata version %d is not supported", message->version);
 
 	switch (mtype)

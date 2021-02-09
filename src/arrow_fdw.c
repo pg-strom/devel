@@ -250,6 +250,7 @@ Datum	pgstrom_arrow_fdw_export_cupy(PG_FUNCTION_ARGS);
 Datum	pgstrom_arrow_fdw_export_cupy_pinned(PG_FUNCTION_ARGS);
 Datum	pgstrom_arrow_fdw_unpin_gpu_buffer(PG_FUNCTION_ARGS);
 Datum	pgstrom_arrow_fdw_put_gpu_buffer(PG_FUNCTION_ARGS);
+Datum	pgstrom_arrow_fdw_import_file(PG_FUNCTION_ARGS);
 
 /*
  * timespec_comp - compare timespec values
@@ -1930,6 +1931,161 @@ ArrowImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 }
 
 /*
+ * pgstrom_arrow_fdw_import_file
+ *
+ * NOTE: Due to historical reason, PostgreSQL does not allow to define
+ * columns more than MaxHeapAttributeNumber (1600) for foreign-tables also,
+ * not only heap-tables. This restriction comes from NULL-bitmap length
+ * in HeapTupleHeaderData and width of t_hoff.
+ * However, it is not a reasonable restriction for foreign-table, because
+ * it does not use heap-format internally.
+ */
+Datum
+pgstrom_arrow_fdw_import_file(PG_FUNCTION_ARGS)
+{
+	CreateForeignTableStmt stmt;
+	ArrowSchema	schema;
+	List	   *tableElts = NIL;
+	char	   *ftable_name;
+	char	   *file_name;
+	char	   *namespace_name;
+	DefElem	   *defel;
+	int			j, nfields;
+	Oid			ftable_oid;
+	Oid			type_oid;
+	int			type_mod;
+	ObjectAddress myself, referenced;
+	ArrowFileInfo af_info;
+
+	/* read schema of the file */
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "foreign table name is not supplied");
+	ftable_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "arrow filename is not supplied");
+	file_name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	defel = makeDefElem("file", (Node *)makeString(file_name), -1);
+
+	if (PG_ARGISNULL(2))
+		namespace_name = NULL;
+	else
+		namespace_name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+	readArrowFile(file_name, &af_info, false);
+	copyArrowNode(&schema.node, &af_info.footer.schema.node);
+	if (schema._num_fields > SHRT_MAX)
+		Elog("Arrow file '%s' has too much fields: %d",
+			 file_name, schema._num_fields);
+
+	/* setup CreateForeignTableStmt */
+	memset(&stmt, 0, sizeof(CreateForeignTableStmt));
+	NodeSetTag(&stmt, T_CreateForeignTableStmt);
+	stmt.base.relation = makeRangeVar(namespace_name, ftable_name, -1);
+
+	nfields = Min(schema._num_fields, 100);
+	for (j=0; j < nfields; j++)
+	{
+		ColumnDef  *cdef;
+
+		type_oid = arrowTypeToPGTypeOid(&schema.fields[j], &type_mod);
+		cdef = makeColumnDef(schema.fields[j].name,
+							 type_oid,
+							 type_mod,
+							 InvalidOid);
+		tableElts = lappend(tableElts, cdef);
+	}
+	stmt.base.tableElts = tableElts;
+	stmt.base.oncommit = ONCOMMIT_NOOP;
+	stmt.servername = "arrow_fdw";
+	stmt.options = list_make1(defel);
+
+	myself = DefineRelation(&stmt.base,
+							RELKIND_FOREIGN_TABLE,
+							InvalidOid,
+							NULL,
+							__FUNCTION__);
+	ftable_oid = myself.objectId;
+	CreateForeignTable(&stmt, ftable_oid);
+
+	if (nfields < schema._num_fields)
+	{
+		Relation	c_rel = table_open(RelationRelationId, RowExclusiveLock);
+		Relation	a_rel = table_open(AttributeRelationId, RowExclusiveLock);
+		CatalogIndexState c_index = CatalogOpenIndexes(c_rel);
+		CatalogIndexState a_index = CatalogOpenIndexes(a_rel);
+		HeapTuple	tup;
+
+		tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(ftable_oid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for relation %u", ftable_oid);
+		
+		for (j=nfields; j < schema._num_fields; j++)
+		{
+			FormData_pg_attribute attr;
+			const char *name = schema.fields[j].name;
+			bool		nullable = schema.fields[j].nullable;
+			Oid			type_oid;
+			int			type_mod;
+			int16		type_len;
+			bool		type_byval;
+			char		type_align;
+
+			type_oid = arrowTypeToPGTypeOid(&schema.fields[j], &type_mod);
+			get_typlenbyvalalign(type_oid,
+								 &type_len,
+								 &type_byval,
+								 &type_align);
+
+			memset(&attr, 0, sizeof(FormData_pg_attribute));
+			attr.attrelid = ftable_oid;
+			strncpy(NameStr(attr.attname), name, NAMEDATALEN);
+			attr.atttypid = type_oid;
+			attr.attstattarget = -1;
+			attr.attlen = type_len;
+			attr.atttypmod = type_mod;
+			attr.attnum = j + 1;
+			attr.attbyval = type_byval;
+			attr.attndims = (type_is_array(type_oid) ? 1 : 0);
+			attr.attstorage = get_typstorage(type_oid);
+			attr.attalign = type_align;
+			attr.attnotnull = !nullable;
+			attr.atthasdef = false;
+			attr.atthasmissing = false;
+			attr.attidentity = '\0';
+			attr.attgenerated = false;
+			attr.attisdropped = false;
+			attr.attislocal = true;
+			attr.attinhcount = 0;
+			attr.attcollation = InvalidOid;
+
+			InsertPgAttributeTuple(a_rel, &attr, a_index);
+
+			/* add dependency */
+			myself.classId = RelationRelationId;
+			myself.objectId = ftable_oid;
+			myself.objectSubId = attr.attnum;
+			referenced.classId = TypeRelationId;
+			referenced.objectId = type_oid;
+			referenced.objectSubId = 0;
+			recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+		}
+		/* update relnatts also */
+		((Form_pg_class) GETSTRUCT(tup))->relnatts = schema._num_fields;
+		CatalogTupleUpdate(c_rel, &tup->t_self, tup);
+		
+		CatalogCloseIndexes(a_index);
+		CatalogCloseIndexes(c_index);
+		table_close(a_rel, RowExclusiveLock);
+		table_close(c_rel, RowExclusiveLock);
+
+		CommandCounterIncrement();
+	}	
+	PG_RETURN_VOID();
+}
+PG_FUNCTION_INFO_V1(pgstrom_arrow_fdw_import_file);
+
+/*
  * ArrowIsForeignScanParallelSafe
  */
 static bool
@@ -2187,6 +2343,7 @@ ArrowExecForeignInsert(EState *estate,
 			elog(ERROR, "Bug? unsupported type format");
 		}
 	}
+	table->usage = usage;
 	table->nitems++;
 	MemoryContextSwitchTo(oldcxt);
 
@@ -2364,8 +2521,8 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 				case 64:
 					return INT8OID;
 				default:
-					elog(ERROR, "Arrow.%s is not supported",
-						 arrowTypeName(field));
+					elog(ERROR, "%s is not supported",
+						 arrowNodeName(&t->node));
 					break;
 			}
 			break;
@@ -2379,8 +2536,8 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 				case ArrowPrecision__Double:
 					return FLOAT8OID;
 				default:
-					elog(ERROR, "Arrow.%s is not supported",
-						 arrowTypeName(field));
+					elog(ERROR, "%s is not supported",
+						 arrowNodeName(&t->node));
 			}
 			break;
 		case ArrowNodeTag__Utf8:
@@ -2414,8 +2571,8 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 				elem_oid = arrowTypeToPGTypeOid(child, &elem_mod);
 				type_oid = get_array_type(elem_oid);
 				if (!OidIsValid(type_oid))
-					elog(ERROR, "array of arrow::%s type is not defined",
-						 arrowTypeName(field));
+					elog(ERROR, "array of %s type is not defined",
+						 arrowNodeName(&t->node));
 				return type_oid;
 			}
 			break;
@@ -2485,7 +2642,7 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 
 				if (!OidIsValid(type_oid))
 					elog(ERROR, "arrow::%s is not supported",
-						 arrowTypeName(field));
+						 arrowNodeName(&t->node));
 				return type_oid;
 			}
 			break;
@@ -4298,6 +4455,7 @@ writeOutArrowRecordBatch(arrowWriteState *aw_state, bool with_footer)
 		if (table->nitems > 0)
 		{
 			mvcc->record_batch = writeArrowRecordBatch(table);
+			sql_table_clear(table);
 			dlist_push_tail(&arrow_metadata_state->mvcc_slots[index],
 							&mvcc->chain);
 			elog(DEBUG2,

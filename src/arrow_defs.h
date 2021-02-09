@@ -14,6 +14,7 @@ typedef enum
 	ArrowMetadataVersion__V2 = 1,		/* not supported */
 	ArrowMetadataVersion__V3 = 2,		/* not supported */
 	ArrowMetadataVersion__V4 = 3,
+	ArrowMetadataVersion__V5 = 4,
 } ArrowMetadataVersion;
 
 /*

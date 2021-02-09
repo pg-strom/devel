@@ -31,6 +31,7 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -102,7 +103,6 @@ struct SQLfield
 	SQLdictionary *enumdict;	/* valid, if enum type */
 
 	ArrowType	arrow_type;		/* type in apache arrow */
-	const char *arrow_typename;	/* typename in apache arrow */
 	/* data save as Apache Arrow datum */
 	size_t	(*put_value)(SQLfield *attr, const char *addr, int sz);
 	/* data buffers of the field */
@@ -116,6 +116,7 @@ struct SQLfield
 	ArrowKeyValue *customMetadata;
 	int			numCustomMetadata;
 };
+
 static inline size_t
 sql_field_put_value(SQLfield *column, const char *addr, int sz)
 {
@@ -131,6 +132,10 @@ struct SQLtable
 	const char *filename;		/* output filename */
 	int			fdesc;			/* output file descriptor */
 	off_t		f_pos;			/* current file position */
+	int			__iov_len;		/* for internal use of pwritev support */
+	int			__iov_cnt;
+	struct iovec *__iov;
+
 	ArrowBlock *recordBatches;	/* recordBatches written in the past */
 	int			numRecordBatches;
 	ArrowBlock *dictionaries;	/* dictionaryBatches written in the past */
@@ -141,6 +146,7 @@ struct SQLtable
 	int			numCustomMetadata;
 	SQLdictionary *sql_dict_list; /* list of SQLdictionary */
 	size_t		segment_sz;		/* threshold of the memory usage */
+	size_t		usage;			/* current buffer usage */
 	size_t		nitems;			/* number of items */
 	int			nfields;		/* number of attributes */
 	SQLfield columns[FLEXIBLE_ARRAY_MEMBER];
@@ -172,11 +178,17 @@ struct SQLdictionary
 extern void		arrowFileWrite(SQLtable *table,
 							   const char *buffer,
 							   ssize_t length);
-extern ssize_t	writeArrowSchema(SQLtable *table);
+extern void		arrowFileWriteIOV(SQLtable *table);
+extern void		writeArrowSchema(SQLtable *table);
 extern void		writeArrowDictionaryBatches(SQLtable *table);
 extern int		writeArrowRecordBatch(SQLtable *table);
 extern void		writeArrowFooter(SQLtable *table);
-extern size_t	estimateArrowBufferLength(SQLfield *column, size_t nitems);
+
+extern size_t	setupArrowRecordBatchIOV(SQLtable *table);
+
+
+
+
 
 /* arrow_nodes.c */
 extern void		__initArrowNode(ArrowNode *node, ArrowNodeTag tag);
@@ -185,7 +197,7 @@ extern void		__initArrowNode(ArrowNode *node, ArrowNodeTag tag);
 extern char	   *dumpArrowNode(ArrowNode *node);
 extern void		copyArrowNode(ArrowNode *dest, const ArrowNode *src);
 extern void		readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
-extern char	   *arrowTypeName(ArrowField *field);
+extern const char *arrowNodeName(ArrowNode *node);
 
 /* arrow_pgsql.c */
 extern int		assignArrowTypePgSQL(SQLfield *column,
@@ -223,6 +235,7 @@ extern void	   *palloc(size_t sz);
 extern void	   *palloc0(size_t sz);
 extern char	   *pstrdup(const char *orig);
 extern void	   *repalloc(void *ptr, size_t sz);
+extern void		pfree(void *ptr);
 
 static inline void
 sql_buffer_init(SQLbuffer *buf)
@@ -278,9 +291,24 @@ sql_buffer_append(SQLbuffer *buf, const void *src, size_t len)
 static inline void
 sql_buffer_append_zero(SQLbuffer *buf, size_t len)
 {
-	sql_buffer_expand(buf, buf->usage + len);
-	memset(buf->data + buf->usage, 0, len);
-	buf->usage += len;
+	if (len > 0)
+	{
+		sql_buffer_expand(buf, buf->usage + len);
+		memset(buf->data + buf->usage, 0, len);
+		buf->usage += len;
+	}
+	assert(buf->usage <= buf->length);
+}
+
+static inline void
+sql_buffer_append_char(SQLbuffer *buf, int c, size_t len)
+{
+	if (len > 0)
+	{
+		sql_buffer_expand(buf, buf->usage + len);
+		memset(buf->data + buf->usage, c, len);
+		buf->usage += len;
+	}
 	assert(buf->usage <= buf->length);
 }
 
@@ -325,5 +353,54 @@ sql_buffer_copy(SQLbuffer *dest, const SQLbuffer *orig)
 		memcpy(dest->data, orig->data, orig->usage);
 		dest->usage = orig->usage;
 	}
+}
+
+static inline void
+sql_field_clear(SQLfield *column)
+{
+	int		j;
+
+	column->nitems = 0;
+	column->nullcount = 0;
+	sql_buffer_clear(&column->nullmap);
+	sql_buffer_clear(&column->values);
+	sql_buffer_clear(&column->extra);
+	column->__curr_usage__ = 0;
+
+	if (column->element)
+		sql_field_clear(column->element);
+	if (column->nfields > 0)
+	{
+		for (j=0; j < column->nfields; j++)
+			sql_field_clear(&column->subfields[j]);
+	}
+}
+
+static inline void
+sql_table_clear(SQLtable *table)
+{
+	int		j;
+
+	for (j=0; j < table->nfields; j++)
+		sql_field_clear(&table->columns[j]);
+	table->nitems = 0;
+	table->usage = 0;
+}
+
+static inline int
+sql_table_append_record_batch(SQLtable *table, ArrowBlock *block)
+{
+	int			index = table->numRecordBatches++;
+
+	if (!table->recordBatches)
+		table->recordBatches = palloc(sizeof(ArrowBlock) * 32);
+	else
+	{
+		size_t	sz = sizeof(ArrowBlock) * (index + 1);
+		table->recordBatches = repalloc(table->recordBatches, sz);
+	}
+	memcpy(&table->recordBatches[index], block, sizeof(ArrowBlock));
+
+	return index;
 }
 #endif	/* ARROW_IPC_H */
