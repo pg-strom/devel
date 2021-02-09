@@ -68,7 +68,7 @@ MAXREGCOUNT := 128
 #
 # Source file of utilities
 #
-__STROM_UTILS = gpuinfo pg2arrow gstore_backup dbgen-ssbm
+__STROM_UTILS = gpuinfo pg2arrow dbgen-ssbm
 ifdef WITH_MYSQL2ARROW
 __STROM_UTILS += mysql2arrow
 MYSQL_CONFIG = mysql_config
@@ -117,18 +117,6 @@ MYSQL2ARROW_CFLAGS = -D__MYSQL2ARROW__=1 -D_GNU_SOURCE -g -Wall \
                      $(shell $(MYSQL_CONFIG) --cflags) \
                      $(shell $(MYSQL_CONFIG) --libs) \
                      -Wl,-rpath,$(shell $(MYSQL_CONFIG) --variable=pkglibdir)
-
-GSTORE_BACKUP = $(STROM_BUILD_ROOT)/utils/gstore_backup
-GSTORE_BACKUP_SOURCE = $(GSTORE_BACKUP).c
-GSTORE_BACKUP_CFLAGS = -D_GNU_SOURCE -g -Wall \
-                       -I $(STROM_BUILD_ROOT)/src \
-                       -I $(STROM_BUILD_ROOT)/utils \
-                       -I $(shell $(PG_CONFIG) --includedir) \
-                       -I $(shell $(PG_CONFIG) --includedir-server) \
-                       -L $(shell $(PG_CONFIG) --libdir) \
-                       $(shell $(PG_CONFIG) --ldflags)
-GSTORE_BACKUP_DEPEND = $(GSTORE_BACKUP_SOURCE) \
-                       $(STROM_BUILD_ROOT)/src/gstore_fdw.h
 
 SSBM_DBGEN = $(STROM_BUILD_ROOT)/utils/dbgen-ssbm
 __SSBM_DBGEN_SOURCE = bcd2.c  build.c load_stub.c print.c text.c \
@@ -347,9 +335,6 @@ $(PG2ARROW): $(PG2ARROW_DEPEND)
 
 $(MYSQL2ARROW): $(MYSQL2ARROW_DEPEND)
 	$(CC) $(MYSQL2ARROW_SOURCE) -o $@ $(MYSQL2ARROW_CFLAGS)
-
-$(GSTORE_BACKUP): $(GSTORE_BACKUP_DEPEND)
-	$(CC) $(GSTORE_BACKUP_SOURCE) -o $@ $(GSTORE_BACKUP_CFLAGS) -lpq -lpgport
 
 $(SSBM_DBGEN): $(SSBM_DBGEN_SOURCE) $(SSBM_DBGEN_DISTS_DSS)
 	$(CC) $(SSBM_DBGEN_CFLAGS) $(SSBM_DBGEN_SOURCE) -o $@ -lm
