@@ -1,0 +1,260 @@
+---
+--- Test for CPU fallback and GPU kernel suspend / resume on PostgreSQL table
+---
+SET pg_strom.regression_test_mode = on;
+-- this test uses pre-built test table
+SET search_path = pg_temp,pgstrom_regress,public;
+-- disables SeqScan and kernel source
+SET enable_seqscan = off;
+SET max_parallel_workers_per_gather = 0;
+SET pg_strom.debug_kernel_source = off;
+-- GpuScan  with CPU fallback
+SET pg_strom.enabled = on;
+EXPLAIN (verbose, costs off)
+SELECT id, x+y v1, substring(memo, 1, 20) v2
+  INTO test01g
+  FROM fallback_data
+ WHERE memo LIKE '%abc%';
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Custom Scan (GpuScan) on pgstrom_regress.fallback_data
+   Output: id, ((x + y)), ("substring"(memo, 1, 20))
+   GPU Projection: fallback_data.id, (fallback_data.x + fallback_data.y), "substring"(fallback_data.memo, 1, 20)
+   GPU Filter: (fallback_data.memo ~~ '%abc%'::text)
+(4 rows)
+
+SELECT id, x+y v1, substring(memo, 1, 20) v2
+  INTO test01g
+  FROM fallback_data
+ WHERE memo LIKE '%abc%';	-- error
+ERROR:  GPU kernel: compressed or external varlena on device
+SET pg_strom.cpu_fallback = on;
+SELECT id, x+y v1, substring(memo, 1, 20) v2
+  INTO test01g
+  FROM fallback_data
+ WHERE memo LIKE '%abc%';
+SET pg_strom.enabled = off;
+SELECT id, x+y v1, substring(memo, 1, 20) v2
+  INTO test01p
+  FROM fallback_data
+ WHERE memo LIKE '%abc%';
+(SELECT * FROM test01g EXCEPT SELECT * FROM test01p) ORDER BY id;
+ id | v1 | v2 
+----+----+----
+(0 rows)
+
+(SELECT * FROM test01p EXCEPT SELECT * FROM test01g) ORDER BY id;
+ id | v1 | v2 
+----+----+----
+(0 rows)
+
+RESET pg_strom.cpu_fallback;
+-- GpuScan with GPU kernel suspend/resume
+SET pg_strom.enabled = on;
+EXPLAIN (verbose, costs off)
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test02g
+  FROM fallback_data
+ WHERE id > 0;
+                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                             
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (GpuScan) on pgstrom_regress.fallback_data
+   Output: id, ((x + y)), ((x - y)), ((x + '1'::double precision)), ((y + '1'::double precision)), ((x + '2'::double precision)), ((y + '2'::double precision)), ((x + '3'::double precision)), ((y + '4'::double precision)), memo
+   GPU Projection: fallback_data.id, (fallback_data.x + fallback_data.y), (fallback_data.x - fallback_data.y), (fallback_data.x + '1'::double precision), (fallback_data.y + '1'::double precision), (fallback_data.x + '2'::double precision), (fallback_data.y + '2'::double precision), (fallback_data.x + '3'::double precision), (fallback_data.y + '4'::double precision), fallback_data.memo
+   GPU Filter: (fallback_data.id > 0)
+(4 rows)
+
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test02g
+  FROM fallback_data
+ WHERE id > 0;
+SET pg_strom.enabled = off;
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test02p
+  FROM fallback_data
+ WHERE id > 0;
+(SELECT * FROM test02g EXCEPT SELECT * FROM test02p) ORDER BY id;
+ id | a | b | c | d | e | f | g | h | memo 
+----+---+---+---+---+---+---+---+---+------
+(0 rows)
+
+(SELECT * FROM test02p EXCEPT SELECT * FROM test02g) ORDER BY id;
+ id | a | b | c | d | e | f | g | h | memo 
+----+---+---+---+---+---+---+---+---+------
+(0 rows)
+
+-- GpuScan with GPU kernel suspend/resume and CPU fallback
+SET pg_strom.enabled = on;
+EXPLAIN (verbose, costs off)
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test03g
+  FROM fallback_data
+ WHERE memo LIKE '%abc%' OR id > 0;
+                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                             
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (GpuScan) on pgstrom_regress.fallback_data
+   Output: id, ((x + y)), ((x - y)), ((x + '1'::double precision)), ((y + '1'::double precision)), ((x + '2'::double precision)), ((y + '2'::double precision)), ((x + '3'::double precision)), ((y + '4'::double precision)), memo
+   GPU Projection: fallback_data.id, (fallback_data.x + fallback_data.y), (fallback_data.x - fallback_data.y), (fallback_data.x + '1'::double precision), (fallback_data.y + '1'::double precision), (fallback_data.x + '2'::double precision), (fallback_data.y + '2'::double precision), (fallback_data.x + '3'::double precision), (fallback_data.y + '4'::double precision), fallback_data.memo
+   GPU Filter: ((fallback_data.memo ~~ '%abc%'::text) OR (fallback_data.id > 0))
+(4 rows)
+
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test03g
+  FROM fallback_data
+ WHERE memo LIKE '%abc%' OR id > 0;		-- Error
+ERROR:  GPU kernel: compressed or external varlena on device
+SET pg_strom.cpu_fallback = on;
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test03g
+  FROM fallback_data
+ WHERE memo LIKE '%abc%' OR id > 0;
+SET pg_strom.enabled = off;
+SELECT id, x+y a, x-y b, x+1 c, y+1 d, x+2 e, y+2 f, x+3 g, y+4 h, memo
+  INTO test03p
+  FROM fallback_data
+ WHERE memo LIKE '%abc%' OR id > 0;
+(SELECT * FROM test03g EXCEPT SELECT * FROM test03p) ORDER BY id;
+ id | a | b | c | d | e | f | g | h | memo 
+----+---+---+---+---+---+---+---+---+------
+(0 rows)
+
+(SELECT * FROM test03p EXCEPT SELECT * FROM test03g) ORDER BY id;
+ id | a | b | c | d | e | f | g | h | memo 
+----+---+---+---+---+---+---+---+---+------
+(0 rows)
+
+RESET pg_strom.cpu_fallback;
+-- GpuJoin with CPU fallback
+SET pg_strom.enabled = on;
+EXPLAIN (verbose, costs off)
+SELECT id, x+y+z v, memo
+  INTO test10g
+  FROM fallback_data d NATURAL JOIN fallback_small s
+ WHERE memo LIKE '%abc%';
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Custom Scan (GpuJoin) on pgstrom_regress.fallback_small s
+   Output: d.id, ((d.x + d.y) + s.z), d.memo
+   GPU Projection: d.id::integer, d.x::double precision, d.y::double precision, d.memo::text, s.z::double precision
+   Outer Scan: pgstrom_regress.fallback_small s
+   Depth 1: GpuHashJoin
+            HashSize: 8.30KB
+            HashKeys: s.aid
+            JoinQuals: (d.aid = s.aid)
+   ->  Custom Scan (GpuScan) on pgstrom_regress.fallback_data d
+         Output: d.id, d.x, d.y, d.memo, d.aid
+         GPU Projection: d.id, d.x, d.y, d.memo, d.aid
+         GPU Filter: (d.memo ~~ '%abc%'::text)
+(12 rows)
+
+SELECT id, x+y+z v, memo
+  INTO test10g
+  FROM fallback_data d NATURAL JOIN fallback_small s
+ WHERE memo LIKE '%abc%';		-- Error
+ERROR:  GPU kernel: compressed or external varlena on device
+SET pg_strom.cpu_fallback = on;
+SELECT id, x+y+z v, memo
+  INTO test10g
+  FROM fallback_data d NATURAL JOIN fallback_small s
+ WHERE memo LIKE '%abc%';
+SET pg_strom.enabled = off;
+SELECT id, x+y+z v, memo
+  INTO test10p
+  FROM fallback_data d NATURAL JOIN fallback_small s
+ WHERE memo LIKE '%abc%';
+(SELECT * FROM test10g EXCEPT SELECT * FROM test10p) ORDER BY id;
+ id | v | memo 
+----+---+------
+(0 rows)
+
+(SELECT * FROM test10p EXCEPT SELECT * FROM test10g) ORDER BY id;
+ id | v | memo 
+----+---+------
+(0 rows)
+
+RESET pg_strom.cpu_fallback;
+-- GpuJoin with GPU kernel suspend / resume
+SET pg_strom.enabled = on;
+EXPLAIN (verbose, costs off)
+SELECT * INTO test11g
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 1000;
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (GpuJoin) on pgstrom_regress.fallback_data d
+   Output: d.aid, d.id, d.cat, d.x, d.y, d.memo, l.z, l.md5
+   GPU Projection: d.aid::integer, d.id::integer, d.cat::text, d.x::double precision, d.y::double precision, d.memo::text, l.z::double precision, l.md5::character(200)
+   Outer Scan: pgstrom_regress.fallback_data d
+   Depth 1: GpuHashJoin
+            HashSize: 1371.11KB
+            HashKeys: d.aid
+            JoinQuals: (d.aid = l.aid)
+   ->  Custom Scan (GpuScan) on pgstrom_regress.fallback_enlarge l
+         Output: l.z, l.md5, l.aid
+         GPU Projection: l.z, l.md5, l.aid
+         GPU Filter: (l.aid < 1000)
+(12 rows)
+
+SELECT * INTO test11g
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 1000;
+SET pg_strom.enabled = off;
+SELECT * INTO test11p
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 1000;
+(SELECT * FROM test11g EXCEPT SELECT * FROM test11p) ORDER BY id;
+ aid | id | cat | x | y | memo | z | md5 
+-----+----+-----+---+---+------+---+-----
+(0 rows)
+
+(SELECT * FROM test11p EXCEPT SELECT * FROM test11g) ORDER BY id;
+ aid | id | cat | x | y | memo | z | md5 
+-----+----+-----+---+---+------+---+-----
+(0 rows)
+
+-- GpuJoin with GPU kernel suspend / resume, and CPU fallback
+SET pg_strom.enabled = on;
+EXPLAIN (verbose, costs off)
+SELECT *
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 2500 AND memo LIKE '%ab%';
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (GpuJoin) on pgstrom_regress.fallback_data d
+   Output: d.aid, d.id, d.cat, d.x, d.y, d.memo, l.z, l.md5
+   GPU Projection: d.aid::integer, d.id::integer, d.cat::text, d.x::double precision, d.y::double precision, d.memo::text, l.z::double precision, l.md5::character(200)
+   Outer Scan: pgstrom_regress.fallback_data d
+   Outer Scan Filter: (d.memo ~~ '%ab%'::text)
+   Depth 1: GpuHashJoin
+            HashSize: 3429.22KB
+            HashKeys: d.aid
+            JoinQuals: (d.aid = l.aid)
+   ->  Custom Scan (GpuScan) on pgstrom_regress.fallback_enlarge l
+         Output: l.z, l.md5, l.aid
+         GPU Projection: l.z, l.md5, l.aid
+         GPU Filter: (l.aid < 2500)
+(13 rows)
+
+SELECT *
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 2500 AND memo LIKE '%ab%';	-- Error
+ERROR:  GPU kernel: compressed or external varlena on device
+SET pg_strom.cpu_fallback = on;
+SELECT * INTO test12g
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 2500 AND memo LIKE '%ab%';
+SET pg_strom.enabled = off;
+SELECT * INTO test12p
+  FROM fallback_data d NATURAL JOIN fallback_enlarge l
+ WHERE l.aid < 2500 AND memo LIKE '%ab%';
+(SELECT * FROM test12g EXCEPT SELECT * FROM test12p) ORDER BY id;
+ aid | id | cat | x | y | memo | z | md5 
+-----+----+-----+---+---+------+---+-----
+(0 rows)
+
+(SELECT * FROM test12p EXCEPT SELECT * FROM test12g) ORDER BY id;
+ aid | id | cat | x | y | memo | z | md5 
+-----+----+-----+---+---+------+---+-----
+(0 rows)
+
+RESET pg_strom.cpu_fallback;

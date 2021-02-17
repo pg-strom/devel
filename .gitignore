@@ -1,1 +1,6 @@
 Makefile.custom
+*.so
+*.o
+*.fatbin
+*.gfatbin
+

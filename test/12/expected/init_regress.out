@@ -157,6 +157,11 @@ CREATE TABLE fallback_data (
   memo  text
 );
 SELECT pgstrom.random_setseed(20190714);
+ random_setseed 
+----------------
+ 
+(1 row)
+
 INSERT INTO fallback_data (
   SELECT x, pgstrom.random_int(0.5, 1, 4000),
             CASE floor(random()*26)
