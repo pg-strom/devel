@@ -56,6 +56,13 @@
 #endif
 
 /*
+ * MEMO: PG13 added 'Datum attoptions' argument to InsertPgAttributeTuple
+ */
+#if PG_VERSION_NUM < 130000
+#define InsertPgAttributeTuple(a,b,c,d)	InsertPgAttributeTuple((a),(b),(d))
+#endif
+
+/*
  * MEMO: Naming convension of data access macro on some data types
  * were confused before PG11
  */
