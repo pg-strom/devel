@@ -58,10 +58,10 @@ CREATE TYPE pgstrom.gstore_fdw_sysattr
 --- GPU memory store
 ---
 
---- gpustore_synchronizer(max_num_rows, gpu_device_id)
-CREATE FUNCTION pgstrom.gpustore_synchronizer(bigint,int=-1)
+--- gpustore_sync_trigger(option_string)
+CREATE FUNCTION pgstrom.gpustore_synchronizer(text)
   RETURNS trigger
-  AS 'MODULE_PATHNAME','pgstrom_gpustore_synchronizer'
+  AS 'MODULE_PATHNAME','pgstrom_gpustore_sync_trigger'
   LANGUAGE C;
 
 ---

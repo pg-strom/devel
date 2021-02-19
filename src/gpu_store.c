@@ -177,14 +177,113 @@ static CUresult gpuStoreInvokeApplyRedo(GpuStoreSharedDesc *gs_sdesc,
 										bool is_async);
 static CUresult gpuStoreInvokeCompaction(GpuStoreSharedDesc *gs_sdesc,
 										 bool is_async);
-Datum	pgstrom_gpustore_synchronizer(PG_FUNCTION_ARGS);
+Datum	pgstrom_gpustore_sync_trigger(PG_FUNCTION_ARGS);
 void	GpuStoreStartupPreloader(Datum arg);
 
 /*
- * relationHasSynchronizer
+ * parseSyncTriggerOptions
+ */
+typedef struct
+{
+	int			cuda_dindex;
+	int			gpu_sync_interval;
+	int64		max_num_rows;
+} GpuStoreOptions;
+
+static void
+parseSyncTriggerOptions(char *config, GpuStoreOptions *gs_options)
+{
+	int			cuda_dindex = 0;				/* default: GPU0 */
+	int			gpu_sync_interval = 8;			/* default: 8sec */
+	int64		max_num_rows = (10UL << 20);	/* default: 10M rows */
+	char	   *key, *value;
+	char	   *saved;
+
+	if (!config)
+		goto out;
+
+	for (key = strtok_r(config, ",", &saved);
+		 key != NULL;
+		 key = strtok_r(NULL,   ",", &saved))
+	{
+		value = strchr(key, '=');
+		if (!value)
+			elog(ERROR, "gpustore: options syntax error [%s]", key);
+		*value++ = '\0';
+
+		key = trim_cstring(key);
+		value = trim_cstring(value);
+
+		if (strcmp(key, "gpu_device_id") == 0)
+		{
+			int		i, gpu_device_id;
+			char   *host;
+
+			gpu_device_id = strtol(value, &host, 10);
+			if (*host == '@')
+			{
+				char	name[512];
+
+				host++;
+				if (gethostname(name, sizeof(name)) != 0)
+					elog(ERROR, "failed on gethostname: %m");
+				if (strcmp(host, name) != 0)
+					continue;
+			}
+			else if (*host != '\0')
+			{
+				elog(ERROR, "gpustore: invalid option [%s]=[%s]", key, value);
+			}
+
+			cuda_dindex = -1;
+			for (i=0; i < numDevAttrs; i++)
+			{
+				if (devAttrs[i].DEV_ID == gpu_device_id)
+				{
+					cuda_dindex = i;
+					break;
+				}
+			}
+
+			if (cuda_dindex < 0)
+				elog(ERROR, "gpustore: gpu_device_id (%d) not found", gpu_device_id);
+		}
+		else if (strcmp(key, "max_num_rows") == 0)
+		{
+			char   *end;
+
+			max_num_rows = strtol(value, &end, 10);
+			if (*end != '\0')
+				elog(ERROR, "gpustore: invalid option [%s]=[%s]", key, value);
+		}
+		else if (strcmp(key, "gpu_sync_interval") == 0)
+		{
+			char   *end;
+
+			gpu_sync_interval = strtol(value, &end, 10);
+			if (*end != '\0')
+				elog(ERROR, "gpustore: invalid option [%s]=[%s]", key, value);
+		}
+		else
+		{
+			elog(ERROR, "gpustore: unknown option [%s]=[%s]", key, value);
+		}
+	}
+out:
+	if (gs_options)
+	{
+		memset(gs_options, 0, sizeof(GpuStoreOptions));
+		gs_options->cuda_dindex       = cuda_dindex;
+		gs_options->gpu_sync_interval = gpu_sync_interval;
+		gs_options->max_num_rows      = max_num_rows;
+	}
+}
+
+/*
+ * relationHasSyncTrigger
  */
 static bool
-relationHasSynchronizer(Relation rel, int64 *p_max_num_rows, int32 *p_cuda_dindex)
+relationHasSyncTrigger(Relation rel, GpuStoreOptions *gs_options)
 {
 	TriggerDesc *trigdesc = rel->trigdesc;
 	Oid		namespace_oid;
@@ -214,7 +313,7 @@ relationHasSynchronizer(Relation rel, int64 *p_max_num_rows, int32 *p_cuda_dinde
 
 	synchronizer_oid = GetSysCacheOid3(PROCNAMEARGSNSP,
 									   Anum_pg_proc_oid,
-									   CStringGetDatum("gpustore_synchronizer"),
+									   CStringGetDatum("gpustore_sync_trigger"),
 									   PointerGetDatum(argtypes),
 									   ObjectIdGetDatum(namespace_oid));
 	if (!OidIsValid(synchronizer_oid))
@@ -230,71 +329,27 @@ relationHasSynchronizer(Relation rel, int64 *p_max_num_rows, int32 *p_cuda_dinde
 							 TRIGGER_TYPE_INSERT |
 							 TRIGGER_TYPE_DELETE |
 							 TRIGGER_TYPE_UPDATE) &&
-			trig->tgnargs == 2 &&
-			trig->tgargs[0] != NULL &&
-			trig->tgargs[1] != NULL)
+			trig->tgnargs == 1 &&
+			trig->tgargs[0] != NULL)
 		{
 			/* Ok, check argument (must be int8) */
-			Const	   *con0 = (Const *)stringToNode(trig->tgargs[0]);
-			Const	   *con1 = (Const *)stringToNode(trig->tgargs[1]);
-			int64		max_num_rows;
-			int32		gpu_device_id;
-			int			i, cuda_dindex = -1;
+			Const	   *con = (Const *)stringToNode(trig->tgargs[0]);
+			char	   *config;
 
-			if (!IsA(con0, Const) ||
-				con0->consttype != INT8OID ||
-				con0->consttypmod != -1 ||
-				con0->constcollid != InvalidOid)
-				continue;
-			if(!IsA(con1, Const) ||
-			   con1->consttype != INT4OID ||
-			   con1->consttypmod != -1 ||
-			   con1->constcollid != InvalidOid)
-				continue;
-
-			max_num_rows = DatumGetInt64(con0->constvalue);
-			if (max_num_rows < 10000 ||
-                max_num_rows > INT_MAX)
+			if (con->consttype == TEXTOID)
 			{
-				elog(WARNING, "%s: max_num_rows (%ld) is out of range",
-					 __FUNCTION__, max_num_rows);
-				continue;
-			}
-
-			gpu_device_id = DatumGetInt32(con1->constvalue);
-			if (numDevAttrs == 0)
-			{
-				elog(WARNING, "%s: No GPU devices are installed",
-					 __FUNCTION__);
-				continue;
-			}
-			else if (gpu_device_id < 0)
-			{
-				cuda_dindex = 0;	/* assign first GPU */
-			}
-			else
-			{
-				for (i=0; i < numDevAttrs; i++)
+				if (!con->constisnull)
 				{
-					if (devAttrs[i].DEV_ID == gpu_device_id)
-					{
-						cuda_dindex = i;
-						break;
-					}
+					config = TextDatumGetCString(con->constvalue);
+					parseSyncTriggerOptions(config, gs_options);
+					pfree(config);
 				}
-				if (cuda_dindex < 0)
+				else
 				{
-					elog(WARNING, "%s: GPU device id (%d) not found",
-						 __FUNCTION__, gpu_device_id);
-					continue;
+					parseSyncTriggerOptions(NULL, gs_options);
 				}
+				return true;
 			}
-
-			if (p_max_num_rows)
-				*p_max_num_rows = max_num_rows;
-			if (p_cuda_dindex)
-				*p_cuda_dindex = cuda_dindex;
-			return true;
 		}
 	}
 	return false;
@@ -331,7 +386,7 @@ baseRelHasGpuStore(PlannerInfo *root, RelOptInfo *baserel)
 		{
 			rel = relation_open(rte->relid, NoLock);
 
-			retval = relationHasSynchronizer(rel, NULL, NULL);
+			retval = relationHasSyncTrigger(rel, NULL);
 			if (!retval)
 			{
 				/* Add negative entry for relations w/o GPU Store */
@@ -357,7 +412,7 @@ baseRelHasGpuStore(PlannerInfo *root, RelOptInfo *baserel)
 bool
 RelationHasGpuStore(Relation rel)
 {
-	return relationHasSynchronizer(rel, NULL, NULL);
+	return relationHasSyncTrigger(rel, NULL);
 }
 
 /*
@@ -875,8 +930,7 @@ GpuStoreExecInitialLoad(Relation rel, GpuStoreDesc *gs_desc)
 static void
 GpuStoreLookupOrCreateSharedState(Relation rel,
 								  GpuStoreDesc *gs_desc,
-								  int64 max_num_rows,
-								  int32 cuda_dindex)
+								  GpuStoreOptions *gs_options)
 {
 	GpuStoreSharedDesc *gs_sdesc = NULL;
 	dsm_segment *shbuf_seg;
@@ -943,8 +997,8 @@ retry:
 		gs_sdesc->database_oid = MyDatabaseId;
 		gs_sdesc->table_oid = RelationGetRelid(rel);
 		gs_sdesc->initial_load_in_progress = true;		/* !!! blocker !!! */
-		gs_sdesc->max_num_rows = max_num_rows;
-		gs_sdesc->cuda_dindex = cuda_dindex;
+		gs_sdesc->max_num_rows = gs_options->max_num_rows;
+		gs_sdesc->cuda_dindex = gs_options->cuda_dindex;
 		gs_sdesc->redo_length = GPUSTORE_REDO_BUFFER_SIZE;
 		gs_sdesc->redo_apply_threshold = GPUSTORE_REDO_BUFFER_SIZE / 4;
 		gs_sdesc->redo_apply_interval = 5;		/* 5s from last update */
@@ -1002,18 +1056,13 @@ GpuStoreLookupDesc(Relation rel)
 	{
 		PG_TRY();
 		{
-			int64	max_num_rows;
-			int32	cuda_dindex;
+			GpuStoreOptions gs_options;
 
 			memset(&gs_desc->gs_sdesc, 0,
 				   sizeof(GpuStoreDesc) - offsetof(GpuStoreDesc, gs_sdesc));
-			if (relationHasSynchronizer(rel, &max_num_rows, &cuda_dindex))
-			{
-				GpuStoreLookupOrCreateSharedState(rel,
-												  gs_desc,
-												  max_num_rows,
-												  cuda_dindex);
-			}
+			if (relationHasSyncTrigger(rel, &gs_options))
+				GpuStoreLookupOrCreateSharedState(rel, gs_desc,
+												  &gs_options);
 			dlist_init(&gs_desc->pending_rowid_list);
 		}
 		PG_CATCH();
@@ -1289,10 +1338,10 @@ __gpuStoreDeleteLog(HeapTuple tuple,
 }
 
 /*
- * pgstrom_gpustore_synchronizer
+ * pgstrom_gpustore_sync_trigger
  */
 Datum
-pgstrom_gpustore_synchronizer(PG_FUNCTION_ARGS)
+pgstrom_gpustore_sync_trigger(PG_FUNCTION_ARGS)
 {
 	TriggerData	   *trigdata = (TriggerData *) fcinfo->context;
 	TriggerEvent	tg_event = trigdata->tg_event;
@@ -1331,10 +1380,11 @@ pgstrom_gpustore_synchronizer(PG_FUNCTION_ARGS)
 	else
 	{
 		elog(ERROR, "%s: must be called for INSERT, DELETE or UPDATE",
-			__FUNCTION__);
+			 __FUNCTION__);
 	}
 	PG_RETURN_NULL();
 }
+PG_FUNCTION_INFO_V1(pgstrom_gpustore_sync_trigger);
 
 /* ---------------------------------------------------------------- *
  *

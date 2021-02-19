@@ -1626,6 +1626,23 @@ float_as_int(cl_float fval)
 }
 
 /*
+ * trim_cstring - remove spaces from head/tail
+ */
+static inline char *
+trim_cstring(char *str)
+{
+	char   *end;
+
+	while (isspace(*str))
+		str++;
+	end = str + strlen(str) - 1;
+	while (end >= str && isspace(*end))
+		*end-- = '\0';
+
+	return str;
+}
+
+/*
  * pmakeFloat - for convenient; makeFloat + psprintf
  */
 static inline Value *
